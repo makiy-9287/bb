@@ -134,10 +134,17 @@ async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
         preview = reasoning[:500].replace("\n", " ")
         logger.info("🧠 Reasoning (truncated): %s …", preview)
 
-    # ── Model chose NOT to trade ────────────────────────────────
+        # ── Model chose NOT to trade ────────────────────────────────
     if not msg.tool_calls:
         content = (msg.content or "").strip()
-        logger.info("Agent reply: %s", content[:200])
+        if content:
+            logger.info("Agent reply: %s", content[:200])
+        else:
+            # Thinking mode often leaves `content` empty when the
+            # model decides there's nothing to trade.
+            logger.info("Agent decided NO_SETUP (empty content, "
+                        "reasoning length=%d chars)",
+                        len(reasoning) if reasoning else 0)
         return None
 
     # ── Model emitted a tool call ───────────────────────────────
