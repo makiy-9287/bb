@@ -1,6 +1,8 @@
 """
-Main orchestrator.  Runs the hourly signal loop (within the SLST
-execution window) and the continuous trade monitor concurrently.
+Main orchestrator — DAY TRADING MODE.
+
+Scan loop runs every 15 minutes while inside the [12:00–21:00) SLST
+execution window. Trade monitor runs continuously in parallel.
 """
 import asyncio
 import logging
@@ -9,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
-    TOP_COINS_LIMIT, REASONING_EFFORT, DEEPSEEK_MODEL
+    TOP_COINS_LIMIT, REASONING_EFFORT, DEEPSEEK_MODEL,
+    SCAN_INTERVAL_MIN,
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
@@ -26,20 +29,23 @@ logging.basicConfig(
         logging.FileHandler("agent.log"),
     ],
 )
-logger = logging.getLogger("main")
+# Silence noisy library warnings
+logging.getLogger("pandas_ta_classic").setLevel(logging.ERROR)
+logging.getLogger("pandas_ta_classic.utils.core").setLevel(logging.ERROR)
 
+logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
 
 
 def in_execution_window() -> bool:
-    """Return True if current SLST time is within [05:00, 21:00)."""
+    """Return True if current SLST time is within [12:00, 21:00)."""
     now_slst = datetime.now(SLST_TZ)
     t = now_slst.time()
     return SLST_START <= t < SLST_END
 
 
 def _seconds_until_next_window() -> float:
-    """If outside the window, compute seconds until the next 05:00 SLST."""
+    """If outside the window, compute seconds until the next 12:00 SLST."""
     now_slst = datetime.now(SLST_TZ)
     target = now_slst.replace(
         hour=SLST_START.hour, minute=SLST_START.minute,
@@ -50,12 +56,21 @@ def _seconds_until_next_window() -> float:
     return (target - now_slst).total_seconds()
 
 
+def _seconds_to_next_scan_boundary() -> float:
+    """Seconds until the next 15-minute boundary."""
+    now = datetime.now(SLST_TZ)
+    minutes_to_add = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
+    next_boundary = (now + timedelta(minutes=minutes_to_add)).replace(
+        second=0, microsecond=0
+    )
+    return max((next_boundary - now).total_seconds(), 30)
+
+
 async def signal_cycle():
     """One full iteration: fetch → compute → payload → agent."""
     logger.info("═══ Signal cycle starting ═══")
 
     symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
-
     logger.info("Fetching OHLCV for %d symbols …", len(symbols))
     bundle = await fetch_all_data(symbols)
 
@@ -87,7 +102,7 @@ async def signal_cycle():
 
 
 async def signal_loop():
-    """Run signal_cycle every hour while inside the execution window."""
+    """Scan every SCAN_INTERVAL_MIN minutes inside the SLST window."""
     while True:
         if in_execution_window():
             try:
@@ -95,11 +110,7 @@ async def signal_loop():
             except Exception as exc:
                 logger.error("Signal cycle failed: %s", exc, exc_info=True)
 
-            # Sleep to the next hour boundary (guard against negative)
-            now = datetime.now(SLST_TZ)
-            next_hour = (now.replace(minute=0, second=0, microsecond=0)
-                         + timedelta(hours=1))
-            wait_sec = max((next_hour - now).total_seconds(), 30)
+            wait_sec = _seconds_to_next_scan_boundary()
         else:
             wait_sec = max(_seconds_until_next_window(), 60)
             logger.info("Outside execution window — sleeping %.0f min",
@@ -110,10 +121,13 @@ async def signal_loop():
 
 async def main():
     logger.info("╔══════════════════════════════════════════╗")
-    logger.info("║  Binance Futures AI Signal Agent v1.1   ║")
+    logger.info("║  Binance Futures AI Agent — DAY MODE    ║")
     logger.info("╚══════════════════════════════════════════╝")
     logger.info("Model: %s | Reasoning effort: %s",
                 DEEPSEEK_MODEL, REASONING_EFFORT)
+    logger.info("Timeframes: 4H + 1H + 15m | Coins: %d", TOP_COINS_LIMIT)
+    logger.info("Candles per timeframe: 300")
+    logger.info("Scan interval: %d min", SCAN_INTERVAL_MIN)
     logger.info("Execution window: %s – %s SLST",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
 
