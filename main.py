@@ -1,8 +1,12 @@
 """
 Main orchestrator — DAY TRADING MODE.
 
-Scan loop runs every 15 minutes while inside the [12:00–21:00) SLST
-execution window. Trade monitor runs continuously in parallel.
+Trading days: Monday – Thursday only.
+Trading hours: 12:00 – 21:00 SLST.
+Friday, Saturday, Sunday: agent sleeps (no scans).
+
+Scan loop runs every 15 minutes inside the execution window.
+Trade monitor runs continuously in parallel (also paused on off-days).
 """
 import asyncio
 import logging
@@ -29,31 +33,59 @@ logging.basicConfig(
         logging.FileHandler("agent.log"),
     ],
 )
-# Silence noisy library warnings
 logging.getLogger("pandas_ta_classic").setLevel(logging.ERROR)
 logging.getLogger("pandas_ta_classic.utils.core").setLevel(logging.ERROR)
 
 logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
 
+# ── Trading day config ───────────────────────────────────────────
+# Python weekday(): Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+# We only trade Monday–Thursday.
+TRADING_WEEKDAYS = {0, 1, 2, 3}   # Mon, Tue, Wed, Thu
+OFF_WEEKDAYS     = {4, 5, 6}      # Fri, Sat, Sun
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
 
 def in_execution_window() -> bool:
-    """Return True if current SLST time is within [12:00, 21:00)."""
+    """
+    Return True if:
+      • Current SLST day is Monday–Thursday (skip Fri/Sat/Sun)
+      • Current SLST time is within [12:00, 21:00)
+    """
     now_slst = datetime.now(SLST_TZ)
+
+    # Skip Friday, Saturday, Sunday
+    if now_slst.weekday() in OFF_WEEKDAYS:
+        return False
+
     t = now_slst.time()
     return SLST_START <= t < SLST_END
 
 
-def _seconds_until_next_window() -> float:
-    """If outside the window, compute seconds until the next 12:00 SLST."""
-    now_slst = datetime.now(SLST_TZ)
-    target = now_slst.replace(
+def _next_window_start(now_slst: datetime) -> datetime:
+    """Find the next valid trading-window start:
+    the next Mon–Thu day at SLST_START (12:00 SLST)."""
+    candidate = now_slst.replace(
         hour=SLST_START.hour, minute=SLST_START.minute,
-        second=0, microsecond=0
+        second=0, microsecond=0,
     )
-    if now_slst >= target:
-        target += timedelta(days=1)
-    return (target - now_slst).total_seconds()
+
+    # If today's window start has already passed,
+    # OR today is Fri/Sat/Sun, advance to the next trading day.
+    if candidate <= now_slst or candidate.weekday() in OFF_WEEKDAYS:
+        candidate += timedelta(days=1)
+        while candidate.weekday() in OFF_WEEKDAYS:
+            candidate += timedelta(days=1)
+
+    return candidate
+
+
+def _seconds_until_next_window() -> float:
+    """Seconds until the next valid trading window opens."""
+    now_slst = datetime.now(SLST_TZ)
+    target = _next_window_start(now_slst)
+    return max((target - now_slst).total_seconds(), 60)
 
 
 def _seconds_to_next_scan_boundary() -> float:
@@ -64,6 +96,15 @@ def _seconds_to_next_scan_boundary() -> float:
         second=0, microsecond=0
     )
     return max((next_boundary - now).total_seconds(), 30)
+
+
+def _fmt_sleep(seconds: float) -> str:
+    """Pretty-format seconds into 'X h Y m' or 'Y m'."""
+    if seconds >= 3600:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+    return f"{int(seconds // 60)}m"
 
 
 async def signal_cycle():
@@ -102,8 +143,11 @@ async def signal_cycle():
 
 
 async def signal_loop():
-    """Scan every SCAN_INTERVAL_MIN minutes inside the SLST window."""
+    """Scan every SCAN_INTERVAL_MIN minutes, Mon–Thu, 12:00–21:00 SLST."""
     while True:
+        now = datetime.now(SLST_TZ)
+        day_name = DAY_NAMES[now.weekday()]
+
         if in_execution_window():
             try:
                 await signal_cycle()
@@ -112,9 +156,15 @@ async def signal_loop():
 
             wait_sec = _seconds_to_next_scan_boundary()
         else:
-            wait_sec = max(_seconds_until_next_window(), 60)
-            logger.info("Outside execution window — sleeping %.0f min",
-                        wait_sec / 60)
+            wait_sec = _seconds_until_next_window()
+
+            # Clear, informative log message
+            if now.weekday() in OFF_WEEKDAYS:
+                logger.info("[%s] Market OFF-DAY — agent sleeping %s until next window",
+                            day_name, _fmt_sleep(wait_sec))
+            else:
+                logger.info("[%s] Outside trading hours (%s SLST) — sleeping %s",
+                            day_name, now.strftime("%H:%M"), _fmt_sleep(wait_sec))
 
         await asyncio.sleep(wait_sec)
 
@@ -128,8 +178,10 @@ async def main():
     logger.info("Timeframes: 4H + 1H + 15m | Coins: %d", TOP_COINS_LIMIT)
     logger.info("Candles per timeframe: 300")
     logger.info("Scan interval: %d min", SCAN_INTERVAL_MIN)
-    logger.info("Execution window: %s – %s SLST",
+    logger.info("Trading days: Monday – Thursday")
+    logger.info("Trading hours: %s – %s SLST (Sri Lanka Time)",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
+    logger.info("Off days: Friday, Saturday, Sunday")
 
     await asyncio.gather(
         signal_loop(),
