@@ -18,12 +18,30 @@ logger = logging.getLogger(__name__)
 # ── helpers ──────────────────────────────────────────────────────
 
 def _safe_round(v, decimals=4):
-    """Round numeric values safely; return None for NaN/inf."""
+    """Round numeric values safely; return None for NaN/inf/None."""
     try:
+        if v is None:
+            return None
         f = float(v)
         if np.isnan(f) or np.isinf(f):
             return None
         return round(f, decimals)
+    except Exception:
+        return None
+
+
+def _last(series):
+    """FIX: Safely extract the last value of a pandas Series.
+    Returns None if the series is None, empty, or has no valid value.
+    This guards against pandas_ta_classic returning None when there
+    aren't enough candles for the requested indicator length."""
+    if series is None:
+        return None
+    try:
+        if len(series) == 0:
+            return None
+        val = series.iloc[-1]
+        return val
     except Exception:
         return None
 
@@ -49,24 +67,40 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {}
 
-    # ── momentum / trend ────────────────────────────────────────
-    out["rsi"] = _safe_round(ta.rsi(close, length=14).iloc[-1], 2)
-    ema20  = ta.ema(close, length=20)
-    ema50  = ta.ema(close, length=50)
-    ema200 = ta.ema(close, length=200)
-    out["ema20"]  = _safe_round(ema20.iloc[-1])
-    out["ema50"]  = _safe_round(ema50.iloc[-1])
-    out["ema200"] = _safe_round(ema200.iloc[-1])
-    out["ema_trend"] = (
-        "bull" if ema20.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]
-        else "bear" if ema20.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1]
-        else "range"
+    # ── momentum / trend (FIX: guarded with _last()) ────────────
+    out["rsi"] = _safe_round(_last(ta.rsi(close, length=14)), 2)
+
+    ema20_val  = _last(ta.ema(close, length=20))
+    ema50_val  = _last(ta.ema(close, length=50))
+    ema200_val = _last(ta.ema(close, length=200))
+
+    out["ema20"]  = _safe_round(ema20_val)
+    out["ema50"]  = _safe_round(ema50_val)
+    out["ema200"] = _safe_round(ema200_val)
+
+    # FIX: ema_trend now handles missing EMA values gracefully
+    if ema20_val is not None and ema50_val is not None and ema200_val is not None:
+        if ema20_val > ema50_val > ema200_val:
+            out["ema_trend"] = "bull"
+        elif ema20_val < ema50_val < ema200_val:
+            out["ema_trend"] = "bear"
+        else:
+            out["ema_trend"] = "range"
+    elif ema20_val is not None and ema50_val is not None:
+        # Partial trend if EMA200 unavailable (new listing)
+        out["ema_trend"] = "bull" if ema20_val > ema50_val else "bear"
+    else:
+        out["ema_trend"] = None
+
+    atr_val = _last(ta.atr(high, low, close, length=14))
+    out["atr"]     = _safe_round(atr_val)
+    out["atr_pct"] = (
+        _safe_round(atr_val / close.iloc[-1] * 100, 2)
+        if atr_val is not None and close.iloc[-1] != 0 else None
     )
-    atr = ta.atr(high, low, close, length=14)
-    out["atr"]     = _safe_round(atr.iloc[-1])
-    out["atr_pct"] = _safe_round(atr.iloc[-1] / close.iloc[-1] * 100, 2)
 
     # ── volume profile / POC ────────────────────────────────────
+    # (unchanged — insert your existing POC code here)
     price_bins = np.linspace(low.min(), high.max(), POC_BINS + 1)
     mid        = (high + low + close) / 3
     bin_idx    = np.digitize(mid, price_bins) - 1
@@ -83,6 +117,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     )
 
     # ── premium / discount ──────────────────────────────────────
+    # (unchanged — insert your existing P/D code here)
     recent_high = high.tail(50).max()
     recent_low  = low.tail(50).min()
     eq          = (recent_high + recent_low) / 2
@@ -97,13 +132,12 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     out["price_vs_eq_pct"] = _safe_round((close.iloc[-1] - eq) / eq * 100, 2)
 
     # ── SMC: swing structure ────────────────────────────────────
-    # FIX: initialise shl before try so it's always defined
+    # (unchanged — insert your existing swing block here)
     shl = pd.DataFrame()
     try:
         shl = _swing_highs_lows(df)
         levels = shl["Level"].dropna()
         types  = shl["HighLow"].dropna()
-        # FIX: use last valid swing, not iloc[-2] which can be fragile
         if len(levels) >= 1 and len(types) >= 1:
             last_type = types.iloc[-1]
             out["swing_high"] = _safe_round(levels.iloc[-1]) if last_type == 1 else None
@@ -114,6 +148,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["swing_high"] = out["swing_low"] = None
 
     # ── SMC: BOS / CHoCH ────────────────────────────────────────
+    # (unchanged — insert your existing BOS/CHoCH block here)
     try:
         bos_choch = smc.bos_choch(ohlc, shl, close_break=True)
         bos_vals   = bos_choch["BOS"].dropna()
@@ -127,6 +162,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["bos_level"] = None
 
     # ── SMC: Order Blocks ───────────────────────────────────────
+    # (unchanged — insert your existing OB block here)
     try:
         ob = smc.ob(ohlc, shl, close_mitigation=True)
         ob_valid = ob[ob["OB"] != 0].dropna(subset=["Top", "Bottom"])
@@ -145,6 +181,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
                     "ob_bottom": None, "ob_strength": None})
 
     # ── SMC: FVG ────────────────────────────────────────────────
+    # (unchanged — insert your existing FVG block here)
     try:
         fvg = smc.fvg(ohlc, join_consecutive=False)
         fvg_valid = fvg[fvg["FVG"] != 0].dropna(subset=["Top", "Bottom"])
@@ -159,6 +196,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out.update({"fvg_type": None, "fvg_top": None, "fvg_bottom": None})
 
     # ── SMC: Liquidity ──────────────────────────────────────────
+    # (unchanged — insert your existing liquidity block here)
     try:
         liq = smc.liquidity(ohlc, shl, range_percent=LIQUIDITY_RANGE_PCT)
         liq_valid = liq[liq["Liquidity"] != 0].dropna(subset=["Level"])
@@ -184,8 +222,13 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 def compute_multi_timeframe(
     symbol: str, data: Dict[str, pd.DataFrame]
 ) -> Dict[str, Any]:
-    """Compute indicators for all timeframes of one symbol."""
+    """Compute indicators for all timeframes of one symbol.
+    FIX: Individual timeframe failures no longer kill the whole symbol."""
     result = {"symbol": symbol}
     for tf, df in data.items():
-        result[tf] = compute_indicators(df)
+        try:
+            result[tf] = compute_indicators(df)
+        except Exception as exc:
+            logger.warning("TF failure %s %s: %s", symbol, tf, exc)
+            result[tf] = {}
     return result
