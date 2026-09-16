@@ -1,10 +1,14 @@
 """
-The DeepSeek agent.  Receives the compact JSON payload, calls
-deepseek-flash with thinking mode + reasoning_effort=medium, and
-executes any trade signals the model emits.
+DeepSeek agent — strict 5-confirmation SMC/ICT entry filter.
+
+Reasoning effort = high (per DeepSeek docs, thinking mode default is
+high; medium maps to high, so "high" is the effective ceiling for
+non-max requests).
 """
 import json
 import logging
+import os
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
@@ -19,35 +23,55 @@ logger = logging.getLogger(__name__)
 
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-SYSTEM_PROMPT = """You are an elite crypto futures trader specialising in SMC/ICT,
+
+SYSTEM_PROMPT = """You are an elite crypto futures day trader specialising in SMC/ICT,
 liquidity, support/resistance, and premium/discount strategies.
 
-You will receive a compact JSON payload containing multi-timeframe data for the
-top 70 Binance Futures coins. Each coin has 1D, 4H, and 1H sections.
+You receive a compact JSON payload for the top 50 Binance Futures coins.
+Each coin has 4H, 1H, and 15m sections.
 
-Think through the setups step by step before deciding. Analyse:
-1. Market structure alignment (BOS/CHoCH) across timeframes
-2. Premium/discount positioning
-3. Order Block + FVG confluence
-4. Liquidity sweeps / pools
-5. RSI momentum confirmation
+## Task
+Find the BEST trade setup across all coins. Emit AT MOST one signal per cycle.
+If no valid setup exists, reply exactly "NO_SETUP".
 
-A valid setup MUST have CONFLUENCE across timeframes:
-   - Market structure (BOS/CHoCH) aligned
-   - Price in discount (for longs) or premium (for shorts)
-   - Order Block or FVG confluence
-   - Liquidity sweep confirmation
-   - RSI not overbought/oversold against direction
+## MANDATORY 5-Confirmation Rule
+A signal is ONLY valid when ALL 5 confirmations align:
+  1. Market structure (BOS/CHoCH) aligned across 2+ timeframes
+  2. Price in discount (for LONG) or premium (for SHORT)
+  3. Order Block OR FVG confluence nearby
+  4. Liquidity sweep confirmation (recent)
+  5. RSI supportive (not overbought for LONG / oversold for SHORT)
 
-If a setup exists, call the `send_trade_signal` tool with exact values.
-If NO valid setup exists, simply reply "NO_SETUP". Do not force a trade.
+If ANY confirmation is missing, reply "NO_SETUP". Do NOT force trades.
 
-SL/TP rules:
-- SL must be placed beyond the nearest structure level (swing high/low or OB edge).
-- TP1 = 1R, TP2 = 2R, TP3 = 3R from entry, adjusted to nearest liquidity level.
-- Use ATR to ensure SL is not too tight (minimum 0.5× ATR away).
+## Confidence Tier
+- All 5 aligned + HTF (4H) trend strongly directional -> "high"
+- All 5 aligned + HTF trend moderate -> "medium"
+- All 5 aligned but 15m entry imperfect -> "low"
 
-Be extremely selective. Only the highest-probability setup should be emitted."""
+## SL/TP Rules
+- SL: just beyond nearest structure level (swing high/low, OB edge, or bb edge)
+  AND at least 0.5x ATR away from entry
+- TP1: nearest liquidity level OR 1R (whichever is closer)
+- TP2: 2R OR next S/R cluster
+- TP3: 3R OR opposite-side liquidity
+
+## Field Reference
+bb/bbT/bbB   = Breaker Block
+obL/fvgL     = top 3 recent Order Blocks / FVGs
+obM/fvgM     = mitigation status
+liqBS/liqSS  = buy-side / sell-side liquidity
+sr           = top 5 S/R clusters
+rsiDiv       = RSI divergence
+rv           = relative volume
+vah/val      = Value Area High/Low
+oteL/oteS    = Optimal Trade Entry zones
+sh2/sl2      = second-to-last swings
+
+## Discipline
+Quality over quantity. A cycle with no signal is perfectly acceptable.
+Emit the reason field as a concise confluence summary (max 120 chars)."""
+
 
 TOOLS = [
     {
@@ -68,7 +92,7 @@ TOOLS = [
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                     "reason": {
                         "type": "string",
-                        "description": "Concise SMC/ICT confluence summary (max 120 chars).",
+                        "description": "Concise confluence summary (max 120 chars).",
                     },
                 },
                 "required": ["symbol", "direction", "entry", "sl",
@@ -80,33 +104,42 @@ TOOLS = [
 
 
 def _build_request_kwargs() -> dict:
-    """Assemble the kwargs for the DeepSeek call, toggling thinking mode."""
+    """Assemble kwargs for DeepSeek. Thinking mode ignores temperature."""
     kwargs: Dict[str, Any] = {
         "model": DEEPSEEK_MODEL,
         "tools": TOOLS,
         "tool_choice": "auto",
-        "max_tokens": 1200,
+        "max_tokens": 2000,
     }
 
     if USE_THINKING:
-        # Thinking mode: temperature/top_p/penalties are ignored by DeepSeek
-        # per official docs. We therefore do NOT pass temperature at all.
+        # Per DeepSeek docs, thinking mode is enabled by default with
+        # default effort = high. We set it explicitly.
         kwargs["reasoning_effort"] = REASONING_EFFORT
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         logger.info("Thinking mode ON, reasoning_effort=%s", REASONING_EFFORT)
     else:
-        # Non-thinking fallback: temperature is respected here
         kwargs["temperature"] = 0.2
 
     return kwargs
 
 
+def _save_reasoning(reasoning: str):
+    """Save full reasoning trace to disk for inspection."""
+    try:
+        debug_dir = "debug_reasoning"
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = f"{debug_dir}/{ts}.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(reasoning)
+        logger.debug("Reasoning saved → %s", path)
+    except Exception as e:
+        logger.warning("Could not save reasoning: %s", e)
+
+
 async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
-    """
-    Send the payload to DeepSeek.  If the model returns a tool call,
-    execute it (send Telegram signal) and return the signal dict.
-    Otherwise return None.
-    """
+    """Send payload to DeepSeek and execute any emitted signal."""
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY is not set")
         return None
@@ -128,26 +161,25 @@ async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
     choice = response.choices[0]
     msg = choice.message
 
-    # ── Log the chain-of-thought (if present) ───────────────────
+    # ── Log + save reasoning ────────────────────────────────────
     reasoning = getattr(msg, "reasoning_content", None)
     if reasoning:
         preview = reasoning[:500].replace("\n", " ")
-        logger.info("🧠 Reasoning (truncated): %s …", preview)
+        logger.info("🧠 Reasoning (%d chars, truncated): %s …",
+                    len(reasoning), preview)
+        _save_reasoning(reasoning)
 
-        # ── Model chose NOT to trade ────────────────────────────────
+    # ── No trade ────────────────────────────────────────────────
     if not msg.tool_calls:
         content = (msg.content or "").strip()
         if content:
             logger.info("Agent reply: %s", content[:200])
         else:
-            # Thinking mode often leaves `content` empty when the
-            # model decides there's nothing to trade.
-            logger.info("Agent decided NO_SETUP (empty content, "
-                        "reasoning length=%d chars)",
+            logger.info("Agent decided NO_SETUP (reasoning=%d chars)",
                         len(reasoning) if reasoning else 0)
         return None
 
-    # ── Model emitted a tool call ───────────────────────────────
+    # ── Trade signal ────────────────────────────────────────────
     tool_call = msg.tool_calls[0]
     args_str = tool_call.function.arguments or ""
     if not args_str:
@@ -160,12 +192,12 @@ async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
         logger.error("Failed to parse tool arguments: %s", args_str)
         return None
 
-    logger.info("Agent signal: %s %s", args["direction"], args["symbol"])
+    logger.info("🚀 Agent signal: %s %s (confidence=%s)",
+                args["direction"], args["symbol"], args.get("confidence"))
 
     sent = await send_signal(args)
     if sent:
         logger.info("Signal sent to Telegram for %s", args["symbol"])
         return args
-    else:
-        logger.error("Failed to send Telegram signal")
-        return None
+    logger.error("Failed to send Telegram signal")
+    return None
