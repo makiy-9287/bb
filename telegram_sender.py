@@ -1,5 +1,6 @@
 """
-Sends formatted signals to Telegram using the Bot API.
+Sends signals + raw messages to Telegram via the Bot API.
+Markdown escaping fixed to avoid Telegram 400 errors on special chars.
 """
 import logging
 import aiohttp
@@ -7,18 +8,21 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
 
+# Characters that need escaping in legacy Markdown
+_MD_SPECIALS = ("_", "*", "`", "[", "]")
+
 
 def _escape_md(text: str) -> str:
-    """Escape legacy Markdown special chars in dynamic text."""
-    for ch in ("_", "*", "`", "["):
+    """Escape legacy Markdown special characters."""
+    if not text:
+        return ""
+    for ch in _MD_SPECIALS:
         text = text.replace(ch, f"\\{ch}")
     return text
 
 
 async def send_signal(signal: dict) -> bool:
-    """
-    Send a trade signal to the configured Telegram chat.
-    """
+    """Send a formatted trade signal to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Telegram credentials not configured")
         return False
@@ -31,7 +35,7 @@ async def send_signal(signal: dict) -> bool:
     tp2        = signal.get("tp2", "-")
     tp3        = signal.get("tp3", "-")
     confidence = signal.get("confidence", "-")
-    reason     = _escape_md(signal.get("reason", ""))
+    reason     = _escape_md(str(signal.get("reason", "")))
 
     emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
 
@@ -59,22 +63,24 @@ async def send_signal(signal: dict) -> bool:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=10) as resp:
-                ok = resp.status == 200
-                if not ok:
+                if resp.status != 200:
                     body = await resp.text()
-                    logger.error("Telegram send failed %s: %s", resp.status, body)
-                return ok
+                    logger.error("Telegram send failed %s: %s",
+                                 resp.status, body)
+                    return False
+                return True
     except Exception as exc:
         logger.error("Telegram send exception: %s", exc)
         return False
 
 
 async def send_raw_message(text: str) -> bool:
-    """Send a plain text message (status updates, errors, etc.)."""
+    """Send a plain text message (status updates, trade closes)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID,
+               "text": text, "parse_mode": "Markdown"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=10) as resp:
