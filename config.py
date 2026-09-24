@@ -1,5 +1,5 @@
 """
-Configuration module — DAY TRADING MODE.
+Configuration — DAY MODE (Mon–Thu, 12:00–21:00 SLST).
 """
 import os
 from dotenv import load_dotenv
@@ -13,12 +13,12 @@ DEEPSEEK_BASE_URL  = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL     = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
 # ── Reasoning (Thinking Mode) ────────────────────────────────────
-# Per DeepSeek docs: thinking mode default effort = high.
-# Accepted values: low | medium | high | xhigh | max
-# (medium maps to high internally, so use "high" directly)
+# Per DeepSeek docs: accepted values are none|low|high|max.
+# "medium" maps to "high" internally — use "high" directly.
 REASONING_EFFORT   = os.getenv("REASONING_EFFORT", "high")
 USE_THINKING       = os.getenv("USE_THINKING", "true").lower() == "true"
 
+# ── Telegram ─────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -26,12 +26,12 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
 TOP_COINS_LIMIT      = 50
 CANDLE_LIMIT         = 300
-OHLCV_FETCH_LIMIT    = 399
+OHLCV_FETCH_LIMIT    = 399          # weight=2 tier (499 also OK)
 
 # ── Timeframes (DAY MODE) ────────────────────────────────────────
 TIMEFRAMES = ["4h", "1h", "15m"]
 
-# ── Scan Interval ────────────────────────────────────────────────
+# ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
 
 # ── Strategy / SMC ───────────────────────────────────────────────
