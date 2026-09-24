@@ -1,7 +1,8 @@
 """
-Computes all technical indicators and SMC/ICT metrics from OHLCV DataFrames.
-Now includes: Breaker Blocks, multiple FVGs/OBs, S/R clusters, RSI divergence,
-relative volume, VAH/VAL, OTE zones, and mitigation status.
+Technical indicators + SMC/ICT metrics.
+
+All ta.* calls are guarded with _last() so short-history coins
+(e.g. newly-listed) don't crash the pipeline.
 """
 import logging
 from typing import Any, Dict, List
@@ -18,8 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ── helpers ──────────────────────────────────────────────────────
 
-def _safe_round(v, decimals=4):
-    """Round numeric values safely; return None for NaN/inf/None."""
+def _safe_round(v, decimals: int = 4):
     try:
         if v is None:
             return None
@@ -32,7 +32,7 @@ def _safe_round(v, decimals=4):
 
 
 def _last(series):
-    """Safely extract last value of a pandas Series; None if empty/None."""
+    """Safely extract last value; None if None/empty."""
     if series is None:
         return None
     try:
@@ -48,11 +48,13 @@ def _swing_highs_lows(df: pd.DataFrame) -> pd.DataFrame:
     return smc.swing_highs_lows(ohlc, swing_length=SWING_LENGTH)
 
 
-# ── NEW: Breaker Block detection ─────────────────────────────────
+# ── Breaker Block detection ──────────────────────────────────────
 
-def _detect_breaker_blocks(df: pd.DataFrame, ob_df: pd.DataFrame) -> Dict[str, Any]:
-    """A Breaker Block is a former Order Block that price has broken
-    through in the opposite direction."""
+def _detect_breaker_blocks(df: pd.DataFrame, ob_df) -> Dict[str, Any]:
+    """
+    A Breaker Block is a former OB that price closed through in the
+    opposite direction. We scan the *most recent* OBs first.
+    """
     result = {"bb_type": None, "bb_top": None, "bb_bottom": None}
     try:
         if ob_df is None or ob_df.empty:
@@ -62,34 +64,44 @@ def _detect_breaker_blocks(df: pd.DataFrame, ob_df: pd.DataFrame) -> Dict[str, A
             return result
 
         closes = df["close"].values
-        for idx in range(len(valid) - 1, -1, -1):
-            row = valid.iloc[idx]
-            ob_type = int(row["OB"])
-            ob_top = float(row["Top"])
+        n = len(closes)
+
+        for i in range(len(valid) - 1, -1, -1):
+            row = valid.iloc[i]
+            ob_type   = int(row["OB"])
+            ob_top    = float(row["Top"])
             ob_bottom = float(row["Bottom"])
-            ob_idx = valid.index[idx]
-            # Look at candles AFTER this OB
-            break_idx = None
-            if ob_idx + 1 < len(df):
-                subsequent = closes[ob_idx + 1:]
-                if ob_type == 1 and np.any(subsequent < ob_bottom):
-                    break_idx = ob_idx + 1 + int(np.argmax(subsequent < ob_bottom))
-                elif ob_type == -1 and np.any(subsequent > ob_top):
-                    break_idx = ob_idx + 1 + int(np.argmax(subsequent > ob_top))
-            if break_idx is not None:
-                result["bb_type"] = "bear" if ob_type == 1 else "bull"
-                result["bb_top"] = _safe_round(ob_top)
+
+            # position in the ORIGINAL DataFrame
+            ob_pos = valid.index[i]
+            if not isinstance(ob_pos, (int, np.integer)):
+                ob_pos = i
+            if ob_pos >= n:
+                continue
+
+            subsequent = closes[ob_pos + 1:]
+            if len(subsequent) == 0:
+                continue
+
+            if ob_type == 1 and np.any(subsequent < ob_bottom):
+                result["bb_type"]   = "bear"
+                result["bb_top"]    = _safe_round(ob_top)
+                result["bb_bottom"] = _safe_round(ob_bottom)
+                return result
+            if ob_type == -1 and np.any(subsequent > ob_top):
+                result["bb_type"]   = "bull"
+                result["bb_top"]    = _safe_round(ob_top)
                 result["bb_bottom"] = _safe_round(ob_bottom)
                 return result
     except Exception as exc:
-        logger.debug("Breaker block detection failed: %s", exc)
+        logger.debug("BB detection failed: %s", exc)
     return result
 
 
-# ── NEW: Support/Resistance clustering ───────────────────────────
+# ── S/R clustering ───────────────────────────────────────────────
 
 def _detect_sr_levels(shl: pd.DataFrame, current_price: float) -> List[Dict]:
-    """Cluster swing points into S/R zones (within 0.5%)."""
+    """Cluster swing points into S/R zones (within 0.5% of each other)."""
     try:
         if shl is None or shl.empty:
             return []
@@ -97,14 +109,13 @@ def _detect_sr_levels(shl: pd.DataFrame, current_price: float) -> List[Dict]:
         if swing.empty:
             return []
 
-        points = []
-        for i in range(len(swing)):
-            lvl = float(swing["Level"].iloc[i])
-            t   = int(swing["HighLow"].iloc[i])
-            points.append({"price": lvl, "type": "R" if t == 1 else "S"})
+        points = [
+            {"price": float(swing["Level"].iloc[i]),
+             "type": "R" if int(swing["HighLow"].iloc[i]) == 1 else "S"}
+            for i in range(len(swing))
+        ]
 
-        clusters = []
-        used = set()
+        clusters, used = [], set()
         for i, pt in enumerate(points):
             if i in used:
                 continue
@@ -115,42 +126,43 @@ def _detect_sr_levels(shl: pd.DataFrame, current_price: float) -> List[Dict]:
                 if abs(points[j]["price"] - pt["price"]) / pt["price"] < 0.005:
                     group.append(points[j])
                     used.add(j)
-            avg = sum(g["price"] for g in group) / len(group)
+            avg   = sum(g["price"] for g in group) / len(group)
             n_res = sum(1 for g in group if g["type"] == "R")
             n_sup = len(group) - n_res
             clusters.append({
                 "p": _safe_round(avg),
                 "t": "R" if n_res >= n_sup else "S",
                 "n": len(group),
-                "dist": _safe_round(abs(avg - current_price) / current_price * 100, 2),
+                "dist": _safe_round(
+                    abs(avg - current_price) / current_price * 100, 2
+                ),
             })
-        # Sort by proximity to current price, take top 5
         clusters.sort(key=lambda x: x["dist"])
         return clusters[:5]
     except Exception:
         return []
 
 
-# ── NEW: RSI Divergence ──────────────────────────────────────────
+# ── RSI divergence ───────────────────────────────────────────────
 
 def _detect_rsi_divergence(df: pd.DataFrame, rsi_series) -> str | None:
-    """Detect the most recent RSI divergence over last ~30 candles."""
     try:
         if rsi_series is None or len(rsi_series) < 20:
             return None
-        highs, lows = [], []
         n = len(df)
+        highs, lows = [], []
         for i in range(max(1, n - 30), n - 1):
-            if df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]:
-                highs.append((i, float(df["high"].iloc[i]), float(rsi_series.iloc[i])))
-            if df["low"].iloc[i] < df["low"].iloc[i-1] and df["low"].iloc[i] < df["low"].iloc[i+1]:
-                lows.append((i, float(df["low"].iloc[i]), float(rsi_series.iloc[i])))
-        # Bearish: price HH + RSI LH
+            h, hm, hp = df["high"].iloc[i], df["high"].iloc[i-1], df["high"].iloc[i+1]
+            l, lm, lp = df["low"].iloc[i], df["low"].iloc[i-1], df["low"].iloc[i+1]
+            if h > hm and h > hp:
+                highs.append((i, float(h), float(rsi_series.iloc[i])))
+            if l < lm and l < lp:
+                lows.append((i, float(l), float(rsi_series.iloc[i])))
+
         if len(highs) >= 2:
             a, b = highs[-2], highs[-1]
             if b[1] > a[1] and b[2] < a[2]:
                 return "bear"
-        # Bullish: price LL + RSI HL
         if len(lows) >= 2:
             a, b = lows[-2], lows[-1]
             if b[1] < a[1] and b[2] > a[2]:
@@ -160,15 +172,13 @@ def _detect_rsi_divergence(df: pd.DataFrame, rsi_series) -> str | None:
         return None
 
 
-# ── NEW: VAH / VAL from volume profile ───────────────────────────
+# ── Value Area ───────────────────────────────────────────────────
 
 def _compute_value_area(price_bins, vol_profile, total_vol, pct=0.70):
-    """Return (VAH, VAL) = 70% value area high/low from volume profile."""
     try:
         if total_vol <= 0:
             return None, None
-        order = np.argsort(vol_profile)[::-1]
-        cum, chosen = 0.0, []
+        order, cum, chosen = np.argsort(vol_profile)[::-1], 0.0, []
         for b in order:
             cum += vol_profile[b]
             chosen.append(int(b))
@@ -185,7 +195,6 @@ def _compute_value_area(price_bins, vol_profile, total_vol, pct=0.70):
 # ── Main indicator block ─────────────────────────────────────────
 
 def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
-    """Compute all indicators for a single timeframe DataFrame."""
     if df.empty or len(df) < 30:
         return {}
 
@@ -197,8 +206,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     rsi_series = ta.rsi(close, length=14)
     out["rsi"] = _safe_round(_last(rsi_series), 2)
 
-    ema20, ema50, ema200 = (ta.ema(close, length=n) for n in (20, 50, 200))
-    e20, e50, e200 = _last(ema20), _last(ema50), _last(ema200)
+    e20 = _last(ta.ema(close, length=20))
+    e50 = _last(ta.ema(close, length=50))
+    e200 = _last(ta.ema(close, length=200))
     out["ema20"], out["ema50"], out["ema200"] = (
         _safe_round(e20), _safe_round(e50), _safe_round(e200),
     )
@@ -211,7 +221,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["ema_trend"] = None
 
     atr_val = _last(ta.atr(high, low, close, length=14))
-    out["atr"]     = _safe_round(atr_val)
+    out["atr"] = _safe_round(atr_val)
     out["atr_pct"] = (_safe_round(atr_val / close.iloc[-1] * 100, 2)
                       if atr_val and close.iloc[-1] else None)
 
@@ -231,24 +241,22 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     out["vah"], out["val"] = vah, val
 
     # ── premium / discount ──────────────────────────────────────
-    recent_high, recent_low = high.tail(50).max(), low.tail(50).min()
-    eq = (recent_high + recent_low) / 2
+    rh, rl = high.tail(50).max(), low.tail(50).min()
+    eq = (rh + rl) / 2
     out["premium_discount"] = ("premium" if close.iloc[-1] > eq
                                 else "discount" if close.iloc[-1] < eq
                                 else "equilibrium")
-    out["range_high"], out["range_low"] = _safe_round(recent_high), _safe_round(recent_low)
+    out["range_high"], out["range_low"] = _safe_round(rh), _safe_round(rl)
     out["equilibrium"] = _safe_round(eq)
     out["price_vs_eq_pct"] = _safe_round((close.iloc[-1] - eq) / eq * 100, 2)
 
-    # ── OTE zones (0.618–0.79 retracement) ──────────────────────
-    rng = recent_high - recent_low
+    # ── OTE zones ───────────────────────────────────────────────
+    rng = rh - rl
     if rng > 0:
-        ote_lh = recent_high - rng * 0.618
-        ote_ll = recent_high - rng * 0.790
-        ote_sl = recent_low  + rng * 0.618
-        ote_sh = recent_low  + rng * 0.790
-        out["ote_long"]  = [_safe_round(ote_ll), _safe_round(ote_lh)]
-        out["ote_short"] = [_safe_round(ote_sl), _safe_round(ote_sh)]
+        out["ote_long"]  = [_safe_round(rh - rng * 0.790),
+                            _safe_round(rh - rng * 0.618)]
+        out["ote_short"] = [_safe_round(rl + rng * 0.618),
+                            _safe_round(rl + rng * 0.790)]
     else:
         out["ote_long"] = out["ote_short"] = None
 
@@ -258,7 +266,6 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         shl = _swing_highs_lows(df)
         lvls = shl.dropna(subset=["Level"])
         if not lvls.empty:
-            # Last two swing highs and lows
             shs = lvls[lvls["HighLow"] == 1]["Level"].tail(2).tolist()
             sls = lvls[lvls["HighLow"] == -1]["Level"].tail(2).tolist()
             out["swing_high"]  = _safe_round(shs[-1]) if len(shs) >= 1 else None
@@ -266,26 +273,24 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             out["swing_high2"] = _safe_round(shs[-2]) if len(shs) >= 2 else None
             out["swing_low2"]  = _safe_round(sls[-2]) if len(sls) >= 2 else None
         else:
-            out["swing_high"] = out["swing_low"] = None
-            out["swing_high2"] = out["swing_low2"] = None
+            for k in ("swing_high", "swing_low", "swing_high2", "swing_low2"):
+                out[k] = None
     except Exception:
-        out["swing_high"] = out["swing_low"] = None
-        out["swing_high2"] = out["swing_low2"] = None
+        for k in ("swing_high", "swing_low", "swing_high2", "swing_low2"):
+            out[k] = None
 
     # ── BOS / CHoCH ─────────────────────────────────────────────
     try:
         bc = smc.bos_choch(ohlc, shl, close_break=True)
-        bv = bc["BOS"].dropna()
-        cv = bc["CHOCH"].dropna()
-        lv = bc["Level"].dropna()
-        out["bos"]       = int(bv.iloc[-1])   if not bv.empty else 0
-        out["choch"]     = int(cv.iloc[-1])   if not cv.empty else 0
+        bv, cv, lv = bc["BOS"].dropna(), bc["CHOCH"].dropna(), bc["Level"].dropna()
+        out["bos"]       = int(bv.iloc[-1]) if not bv.empty else 0
+        out["choch"]     = int(cv.iloc[-1]) if not cv.empty else 0
         out["bos_level"] = _safe_round(lv.iloc[-1]) if not lv.empty else None
     except Exception:
         out["bos"] = out["choch"] = 0
         out["bos_level"] = None
 
-    # ── Order Blocks + list ─────────────────────────────────────
+    # ── Order Blocks ────────────────────────────────────────────
     ob_df = None
     try:
         ob_df = smc.ob(ohlc, shl, close_mitigation=True)
@@ -295,24 +300,19 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             out["ob_type"]   = "bull" if last["OB"] == 1 else "bear"
             out["ob_top"]    = _safe_round(last["Top"])
             out["ob_bottom"] = _safe_round(last["Bottom"])
-            pct = last.get("Percentage", None)
+            pct = last.get("Percentage")
             out["ob_strength"] = _safe_round(pct, 2) if pct is not None else None
-            # Top 3 OB list
-            ob_list = []
-            for i in range(len(ob_valid) - 1, max(-1, len(ob_valid) - 4), -1):
-                r = ob_valid.iloc[i]
-                ob_list.append({
-                    "t": "bull" if r["OB"] == 1 else "bear",
-                    "top": _safe_round(r["Top"]),
-                    "bot": _safe_round(r["Bottom"]),
-                })
-            out["ob_list"] = ob_list
-            # Mitigation status
+            out["ob_list"] = [
+                {"t": "bull" if ob_valid.iloc[i]["OB"] == 1 else "bear",
+                 "top": _safe_round(ob_valid.iloc[i]["Top"]),
+                 "bot": _safe_round(ob_valid.iloc[i]["Bottom"])}
+                for i in range(len(ob_valid) - 1,
+                               max(-1, len(ob_valid) - 4), -1)
+            ]
             cp = close.iloc[-1]
-            if last["OB"] == 1:
-                out["ob_mit"] = "yes" if cp <= last["Top"] else "no"
-            else:
-                out["ob_mit"] = "yes" if cp >= last["Bottom"] else "no"
+            out["ob_mit"] = ("yes" if (last["OB"] == 1 and cp <= last["Top"])
+                             or (last["OB"] == -1 and cp >= last["Bottom"])
+                             else "no")
         else:
             out.update({"ob_type": None, "ob_top": None, "ob_bottom": None,
                         "ob_strength": None, "ob_list": [], "ob_mit": None})
@@ -321,12 +321,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
                     "ob_strength": None, "ob_list": [], "ob_mit": None})
 
     # ── Breaker Blocks ──────────────────────────────────────────
-    if ob_df is not None:
-        out.update(_detect_breaker_blocks(df, ob_df))
-    else:
-        out.update({"bb_type": None, "bb_top": None, "bb_bottom": None})
+    out.update(_detect_breaker_blocks(df, ob_df))
 
-    # ── FVG + list + mitigation ─────────────────────────────────
+    # ── FVG ─────────────────────────────────────────────────────
     try:
         fvg_df = smc.fvg(ohlc, join_consecutive=False)
         fvg_valid = fvg_df[fvg_df["FVG"] != 0].dropna(subset=["Top", "Bottom"])
@@ -335,20 +332,17 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             out["fvg_type"]   = "bull" if last["FVG"] == 1 else "bear"
             out["fvg_top"]    = _safe_round(last["Top"])
             out["fvg_bottom"] = _safe_round(last["Bottom"])
-            fvg_list = []
-            for i in range(len(fvg_valid) - 1, max(-1, len(fvg_valid) - 4), -1):
-                r = fvg_valid.iloc[i]
-                fvg_list.append({
-                    "t": "bull" if r["FVG"] == 1 else "bear",
-                    "top": _safe_round(r["Top"]),
-                    "bot": _safe_round(r["Bottom"]),
-                })
-            out["fvg_list"] = fvg_list
+            out["fvg_list"] = [
+                {"t": "bull" if fvg_valid.iloc[i]["FVG"] == 1 else "bear",
+                 "top": _safe_round(fvg_valid.iloc[i]["Top"]),
+                 "bot": _safe_round(fvg_valid.iloc[i]["Bottom"])}
+                for i in range(len(fvg_valid) - 1,
+                               max(-1, len(fvg_valid) - 4), -1)
+            ]
             cp = close.iloc[-1]
-            if last["FVG"] == 1:
-                out["fvg_mit"] = "yes" if cp <= last["Top"] else "no"
-            else:
-                out["fvg_mit"] = "yes" if cp >= last["Bottom"] else "no"
+            out["fvg_mit"] = ("yes" if (last["FVG"] == 1 and cp <= last["Top"])
+                              or (last["FVG"] == -1 and cp >= last["Bottom"])
+                              else "no")
         else:
             out.update({"fvg_type": None, "fvg_top": None, "fvg_bottom": None,
                         "fvg_list": [], "fvg_mit": None})
@@ -356,21 +350,16 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out.update({"fvg_type": None, "fvg_top": None, "fvg_bottom": None,
                     "fvg_list": [], "fvg_mit": None})
 
-    # ── Liquidity: all + buy-side + sell-side ───────────────────
+    # ── Liquidity ───────────────────────────────────────────────
     try:
         liq_df = smc.liquidity(ohlc, shl, range_percent=LIQUIDITY_RANGE_PCT)
         liq_valid = liq_df[liq_df["Liquidity"] != 0].dropna(subset=["Level"])
-        cp = close.iloc[-1]
-        bs, ss = [], []
-        all_lv = []
+        cp, bs, ss, all_lv = close.iloc[-1], [], [], []
         if not liq_valid.empty:
             for i in range(len(liq_valid)):
                 lvl = _safe_round(liq_valid["Level"].iloc[i])
                 all_lv.append(lvl)
-                if lvl > cp:
-                    bs.append(lvl)
-                else:
-                    ss.append(lvl)
+                (bs if lvl > cp else ss).append(lvl)
         out["liquidity_levels"] = all_lv[-3:] if all_lv else []
         out["liq_buy_side"]     = bs[-3:] if bs else []
         out["liq_sell_side"]    = ss[-3:] if ss else []
@@ -378,20 +367,16 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["liquidity_levels"] = []
         out["liq_buy_side"] = out["liq_sell_side"] = []
 
-    # ── Support/Resistance clusters ─────────────────────────────
+    # ── S/R + RSI divergence + rel volume ───────────────────────
     out["sr_levels"] = _detect_sr_levels(shl, close.iloc[-1])
-
-    # ── RSI Divergence ──────────────────────────────────────────
-    out["rsi_div"] = _detect_rsi_divergence(df, rsi_series)
-
-    # ── Relative Volume ─────────────────────────────────────────
+    out["rsi_div"]   = _detect_rsi_divergence(df, rsi_series)
     try:
         avg20 = vol.tail(20).mean()
         out["rv"] = _safe_round(vol.iloc[-1] / avg20, 2) if avg20 > 0 else None
     except Exception:
         out["rv"] = None
 
-    # ── Last price action summary ───────────────────────────────
+    # ── Last price action ───────────────────────────────────────
     out["last_close"]      = _safe_round(close.iloc[-1])
     out["last_candle_dir"] = "bull" if close.iloc[-1] > df["open"].iloc[-1] else "bear"
     out["recent_highs"]    = [_safe_round(v) for v in high.tail(5).tolist()]
@@ -400,8 +385,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 
-def compute_multi_timeframe(symbol: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    """Compute indicators for all timeframes of one symbol."""
+def compute_multi_timeframe(
+    symbol: str, data: Dict[str, pd.DataFrame]
+) -> Dict[str, Any]:
     result = {"symbol": symbol}
     for tf, df in data.items():
         try:
