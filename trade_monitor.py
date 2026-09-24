@@ -1,7 +1,5 @@
 """
-Continuous trade monitor — checks SL/TP against live prices every
-MONITOR_INTERVAL_SEC. Sends Telegram updates on close.
-Tracks closed-trade history for /pnl command.
+Continuous trade monitor with race-safe writes + PnL tracking.
 """
 import asyncio
 import json
@@ -20,7 +18,6 @@ from telegram_sender import send_raw_message
 
 logger = logging.getLogger(__name__)
 
-# Lazy lock — created on first use (safe across event loops)
 _trades_lock: Optional[asyncio.Lock] = None
 
 
@@ -31,7 +28,6 @@ def _get_lock() -> asyncio.Lock:
     return _trades_lock
 
 
-# ── File I/O ─────────────────────────────────────────────────────
 def _load_json(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
@@ -51,7 +47,6 @@ def _save_json(path: str, data: List[Dict[str, Any]]):
     os.replace(tmp, path)
 
 
-# ── Public accessors (used by telegram_bot.py) ───────────────────
 def get_active_trades() -> List[Dict[str, Any]]:
     return [t for t in _load_json(ACTIVE_TRADES_FILE)
             if t.get("status") == "open"]
@@ -62,7 +57,6 @@ def get_closed_trades() -> List[Dict[str, Any]]:
 
 
 def calc_pnl(trade: Dict[str, Any], current_price: float) -> Dict[str, float]:
-    """Return {'pnl_pct': float, 'direction': str}."""
     entry = float(trade["entry"])
     if entry == 0:
         return {"pnl_pct": 0.0, "direction": trade["direction"]}
@@ -73,20 +67,28 @@ def calc_pnl(trade: Dict[str, Any], current_price: float) -> Dict[str, float]:
     return {"pnl_pct": pct, "direction": trade["direction"]}
 
 
-# ── Binance price fetch ──────────────────────────────────────────
 async def get_prices(symbols: List[str]) -> Dict[str, float]:
-    """Fetch last price for each symbol via the ticker endpoint."""
+    if not symbols:
+        return {}
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/price"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=10) as resp:
             data = await resp.json()
-    price_map = {item["symbol"]: float(item["price"]) for item in data}
-    return {s: price_map[s] for s in symbols if s in price_map}
+    pm = {i["symbol"]: float(i["price"]) for i in data}
+    return {s: pm[s] for s in symbols if s in pm}
 
 
-# ── Trade lifecycle ──────────────────────────────────────────────
+def _trade_key(t: Dict[str, Any]) -> str:
+    return f"{t.get('symbol','?')}|{t.get('opened_at','')}"
+
+
+def _append_closed(trade: Dict[str, Any]):
+    closed = _load_json(CLOSED_TRADES_FILE)
+    closed.append(trade)
+    _save_json(CLOSED_TRADES_FILE, closed)
+
+
 async def add_trade(signal: Dict[str, Any]):
-    """Register a new trade for monitoring."""
     async with _get_lock():
         trades = _load_json(ACTIVE_TRADES_FILE)
         t = dict(signal)
@@ -97,24 +99,7 @@ async def add_trade(signal: Dict[str, Any]):
     logger.info("Trade added to monitor: %s", signal["symbol"])
 
 
-async def _close_trade(trade: Dict[str, Any], exit_price: float, reason: str):
-    """Move trade from active to closed with PnL snapshot."""
-    trade["status"] = "closed"
-    trade["closed_at"] = datetime.utcnow().isoformat()
-    trade["exit_price"] = exit_price
-    trade["exit_reason"] = reason
-    pnl = calc_pnl(trade, exit_price)
-    trade["pnl_pct"] = round(pnl["pnl_pct"], 4)
-
-    async with _get_lock():
-        closed = _load_json(CLOSED_TRADES_FILE)
-        closed.append(trade)
-        _save_json(CLOSED_TRADES_FILE, closed)
-
-
-# ── Main loop ────────────────────────────────────────────────────
 async def monitor_loop():
-    """Check active trades against live price every MONITOR_INTERVAL_SEC."""
     logger.info("Trade monitor started (interval=%ds)", MONITOR_INTERVAL_SEC)
 
     while True:
@@ -127,55 +112,71 @@ async def monitor_loop():
                 continue
 
             symbols = list({t["symbol"] for t in open_trades})
-            prices = await get_prices(symbols)
+            try:
+                prices = await get_prices(symbols)
+            except Exception as exc:
+                logger.warning("Price fetch failed: %s", exc)
+                await asyncio.sleep(MONITOR_INTERVAL_SEC)
+                continue
 
-            remaining: List[Dict[str, Any]] = []
-            changed = False
-
-            for trade in trades:
-                if trade.get("status") != "open":
-                    remaining.append(trade)
-                    continue
-
+            # Determine which trades to close
+            to_close: Dict[str, tuple] = {}
+            for trade in open_trades:
                 sym = trade["symbol"]
                 price = prices.get(sym)
                 if price is None:
-                    remaining.append(trade)
                     continue
-
-                direction = trade["direction"].upper()
+                d = trade["direction"].upper()
                 hit = None
-
-                if direction == "LONG":
-                    if price <= float(trade["sl"]):       hit = "SL"
-                    elif price >= float(trade["tp3"]):    hit = "TP3"
-                    elif price >= float(trade["tp2"]):    hit = "TP2"
-                    elif price >= float(trade["tp1"]):    hit = "TP1"
+                if d == "LONG":
+                    if price <= float(trade["sl"]):    hit = "SL"
+                    elif price >= float(trade["tp3"]): hit = "TP3"
+                    elif price >= float(trade["tp2"]): hit = "TP2"
+                    elif price >= float(trade["tp1"]): hit = "TP1"
                 else:
-                    if price >= float(trade["sl"]):       hit = "SL"
-                    elif price <= float(trade["tp3"]):    hit = "TP3"
-                    elif price <= float(trade["tp2"]):    hit = "TP2"
-                    elif price <= float(trade["tp1"]):    hit = "TP1"
-
+                    if price >= float(trade["sl"]):    hit = "SL"
+                    elif price <= float(trade["tp3"]): hit = "TP3"
+                    elif price <= float(trade["tp2"]): hit = "TP2"
+                    elif price <= float(trade["tp1"]): hit = "TP1"
                 if hit:
-                    await _close_trade(trade, price, hit)
-                    changed = True
-                    emoji = "✅" if hit.startswith("TP") else "❌"
-                    pnl_pct = trade.get("pnl_pct", 0.0)
-                    await send_raw_message(
-                        f"{emoji} *Trade Closed* — `{sym}`\n"
-                        f"Reason: *{hit}* at `{price}`\n"
-                        f"Direction: {direction}\n"
-                        f"PnL: `{pnl_pct:+.2f}%`"
-                    )
-                    logger.info("Trade closed: %s %s at %s (%.2f%%)",
-                                sym, hit, price, pnl_pct)
-                else:
-                    remaining.append(trade)
+                    to_close[_trade_key(trade)] = (price, hit)
 
-            if changed:
-                async with _get_lock():
-                    _save_json(ACTIVE_TRADES_FILE, remaining)
+            if not to_close:
+                await asyncio.sleep(MONITOR_INTERVAL_SEC)
+                continue
+
+            # Atomic update under lock (fixes race)
+            notifications = []
+            async with _get_lock():
+                current = _load_json(ACTIVE_TRADES_FILE)   # RE-READ inside lock
+                still_open: List[Dict[str, Any]] = []
+                for t in current:
+                    k = _trade_key(t)
+                    if t.get("status") == "open" and k in to_close:
+                        price, hit = to_close[k]
+                        t["status"] = "closed"
+                        t["closed_at"] = datetime.utcnow().isoformat()
+                        t["exit_price"] = price
+                        t["exit_reason"] = hit
+                        pnl = calc_pnl(t, price)
+                        t["pnl_pct"] = round(pnl["pnl_pct"], 4)
+                        _append_closed(t)
+                        notifications.append(
+                            (t["symbol"], hit, price, t["pnl_pct"])
+                        )
+                    else:
+                        still_open.append(t)
+                _save_json(ACTIVE_TRADES_FILE, still_open)
+
+            for sym, hit, price, pnl_pct in notifications:
+                emoji = "✅" if hit.startswith("TP") else "❌"
+                await send_raw_message(
+                    f"{emoji} *Trade Closed* — `{sym}`\n"
+                    f"Reason: *{hit}* at `{price}`\n"
+                    f"PnL: `{pnl_pct:+.2f}%`"
+                )
+                logger.info("Trade closed: %s %s at %s (%.2f%%)",
+                            sym, hit, price, pnl_pct)
 
         except Exception as exc:
             logger.error("Monitor loop error: %s", exc, exc_info=True)
