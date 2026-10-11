@@ -1,10 +1,14 @@
 """
-Telegram Bot API sender — fixed Markdown escaping.
+Telegram Bot API sender — broadcasts to all TELEGRAM_BROADCAST_IDS.
+Returns True if at least one recipient received the message.
 """
+import asyncio
 import logging
+from typing import List
+
 import aiohttp
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_BROADCAST_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -20,31 +24,55 @@ def _escape_md(text: str) -> str:
 
 
 async def _send(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Telegram credentials not configured")
+    """Broadcast `text` to all TELEGRAM_BROADCAST_IDS.
+    Returns True if at least one recipient succeeded."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
         return False
+    if not TELEGRAM_BROADCAST_IDS:
+        logger.error("No TELEGRAM_BROADCAST_IDS configured")
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+    payload_base = {
         "text": text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error("Telegram send failed %s: %s",
-                                 resp.status, body)
-                    return False
-                return True
-    except Exception as exc:
-        logger.error("Telegram exception: %s", exc)
-        return False
+
+    successes = 0
+    failures = 0
+
+    async with aiohttp.ClientSession() as session:
+        for chat_id in TELEGRAM_BROADCAST_IDS:
+            try:
+                async with session.post(
+                    url, json={**payload_base, "chat_id": chat_id}, timeout=10
+                ) as resp:
+                    if resp.status == 200:
+                        successes += 1
+                    else:
+                        failures += 1
+                        body = await resp.text()
+                        logger.error(
+                            "Telegram send to %s failed (%d): %s",
+                            chat_id, resp.status, body[:200],
+                        )
+            except Exception as exc:
+                failures += 1
+                logger.error("Telegram send to %s exception: %s", chat_id, exc)
+
+    if failures:
+        logger.warning("Broadcast: %d sent, %d failed (total=%d)",
+                       successes, failures, len(TELEGRAM_BROADCAST_IDS))
+    else:
+        logger.info("Broadcast delivered to %d recipients", successes)
+
+    return successes > 0
 
 
 async def send_signal(signal: dict) -> bool:
+    """Send a formatted trade signal to all recipients."""
     symbol     = signal.get("symbol", "???")
     direction  = signal.get("direction", "???").upper()
     emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
@@ -66,4 +94,5 @@ async def send_signal(signal: dict) -> bool:
 
 
 async def send_raw_message(text: str) -> bool:
+    """Send a plain message (trade closed, status, etc.) to all recipients."""
     return await _send(text)
