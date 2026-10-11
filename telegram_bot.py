@@ -1,6 +1,11 @@
 """
-Telegram command bot: /help /status /trades /pnl /scan.
-Uses Application.builder() + manual start_polling for asyncio.gather.
+Telegram command bot.
+  /start  — show your chat ID (for anyone)
+  /help   — command list (admin only)
+  /status — agent health (admin only)
+  /trades — active trades + PnL (admin only)
+  /pnl    — performance summary (admin only)
+  /scan   — trigger manual scan (admin only)
 """
 import asyncio
 import logging
@@ -83,9 +88,38 @@ async def _reply(update: Update, text: str) -> None:
         logger.warning("Reply failed: %s", exc)
 
 
-# ── Handlers ─────────────────────────────────────────────────────
+# ── /start — anyone can call, shows chat ID ─────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    if _authorized(update):
+        # Admin → show full help
+        await _reply(update,
+            "🤖 *Agent Commands*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "/status — agent health & schedule\n"
+            "/trades — active trades + live PnL\n"
+            "/pnl    — performance summary\n"
+            "/scan   — trigger manual scan now\n"
+            "/help   — this message"
+        )
+    else:
+        # Non-admin → show their chat ID
+        await _reply(update,
+            f"👋 *Welcome!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Your Telegram Chat ID:\n"
+            f"`{chat.id}`\n\n"
+            f"📌 Send this ID to the bot admin to start receiving\n"
+            f"trade signals."
+        )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
+        await cmd_start(update, context)
         return
     await _reply(update,
         "🤖 *Agent Commands*\n"
@@ -235,15 +269,14 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply(update, "🚀 Manual scan triggered — running now.")
 
 
-# ── Bot lifecycle ────────────────────────────────────────────────
 async def telegram_bot_loop():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set — bot disabled")
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("start",  cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
@@ -252,10 +285,10 @@ async def telegram_bot_loop():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started — /help /status /trades /pnl /scan")
+    logger.info("Telegram bot started — /start /help /status /trades /pnl /scan")
 
     try:
-        await asyncio.Event().wait()     # run forever
+        await asyncio.Event().wait()
     finally:
         await app.updater.stop()
         await app.stop()
