@@ -1,10 +1,7 @@
 """
-Main orchestrator — DAY MODE (Mon–Thu, 12:00–21:00 SLST).
-
-Three concurrent tasks:
-  • signal_loop    — 15-min scans, /scan interruptible
-  • monitor_loop   — SL/TP tracker
-  • telegram_bot   — /status /trades /pnl /scan
+Main orchestrator — DAY MODE.
+Trading window: 13:00–20:00 SLST (Mon–Thu).
+Trade monitor runs 24/7 regardless of window.
 """
 import asyncio
 import logging
@@ -21,9 +18,8 @@ from indicators import compute_multi_timeframe
 from payload_builder import build_payload
 from agent import run_agent
 from trade_monitor import monitor_loop, add_trade
-from telegram_bot import telegram_bot_loop, update_state, AGENT_STATE
+from telegram_bot import telegram_bot_supervisor, update_state, AGENT_STATE
 
-# ── logging ──────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
@@ -64,7 +60,11 @@ def _seconds_to_next_scan_boundary() -> float:
     now = datetime.now(SLST_TZ)
     m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
     nxt = (now + timedelta(minutes=m)).replace(second=0, microsecond=0)
-    return max((nxt - now).total_seconds(), 30)
+    wait = (nxt - now).total_seconds()
+    # Guard: if we're within 5s of the boundary, skip to the next one
+    if wait < 5:
+        wait += SCAN_INTERVAL_MIN * 60
+    return wait
 
 
 def _fmt_sleep(s: float) -> str:
@@ -75,7 +75,6 @@ def _fmt_sleep(s: float) -> str:
 
 async def signal_cycle():
     logger.info("═══ Signal cycle starting ═══")
-
     symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
     logger.info("Fetching OHLCV for %d symbols …", len(symbols))
     bundle = await fetch_all_data(symbols)
@@ -89,13 +88,13 @@ async def signal_cycle():
             logger.warning("Indicator error %s: %s", sym, exc)
 
     if not all_data:
-        logger.warning("No data computed — skipping cycle")
+        logger.warning("No data — skipping cycle")
         return
 
     payload = build_payload(all_data)
     logger.info("Payload size: %.1f KB", len(payload) / 1024)
 
-    logger.info("Sending payload (model=%s, effort=%s) …",
+    logger.info("Sending to DeepSeek (model=%s, effort=%s) …",
                 DEEPSEEK_MODEL, REASONING_EFFORT)
     signal = await run_agent(payload)
 
@@ -112,11 +111,10 @@ async def signal_cycle():
         )
         logger.info("Signal registered: %s", signal["symbol"])
     else:
-        logger.info("No valid setup — discarding iteration")
+        logger.info("No valid setup this cycle")
 
 
 async def signal_loop():
-    """15-min scans during window; interruptible by /scan."""
     scan_event: asyncio.Event = AGENT_STATE["scan_trigger"]
 
     while True:
@@ -139,7 +137,6 @@ async def signal_loop():
                 logger.info("[%s] Outside hours (%s SLST) — sleeping %s",
                             day, now.strftime("%H:%M"), _fmt_sleep(wait_sec))
 
-        # Sleep OR wake early on /scan
         try:
             await asyncio.wait_for(scan_event.wait(), timeout=wait_sec)
             logger.info("🚀 Manual /scan — running now")
@@ -156,16 +153,17 @@ async def main():
     logger.info("╚══════════════════════════════════════════╝")
     logger.info("Model: %s | Reasoning: %s", DEEPSEEK_MODEL, REASONING_EFFORT)
     logger.info("Timeframes: 4H + 1H + 15m | Coins: %d", TOP_COINS_LIMIT)
-    logger.info("Candles: 300 | Scan interval: %d min", SCAN_INTERVAL_MIN)
+    logger.info("Candles: 400 | Scan interval: %d min", SCAN_INTERVAL_MIN)
     logger.info("Trading days: Monday – Thursday")
     logger.info("Trading hours: %s – %s SLST",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
     logger.info("Off days: Friday, Saturday, Sunday")
+    logger.info("Trade monitor runs 24/7 (even outside window)")
 
     results = await asyncio.gather(
         signal_loop(),
         monitor_loop(),
-        telegram_bot_loop(),
+        telegram_bot_supervisor(),
         return_exceptions=True,
     )
     for r in results:
