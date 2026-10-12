@@ -1,6 +1,6 @@
 """
-Compact JSON payload builder.
-Uses config.TIMEFRAMES — no hardcoded timeframe lists.
+Compact JSON payload builder with all ICT/SMC + liquidity fields.
+Uses config.TIMEFRAMES (no hardcoded lists).
 """
 import json
 import logging
@@ -12,25 +12,44 @@ logger = logging.getLogger(__name__)
 
 
 _KEY_MAP = {
+    # Core
     "symbol": "s",
-    "rsi": "rsi", "ema20": "e20", "ema50": "e50", "ema200": "e200",
+    "rsi": "rsi",
+    "ema20": "e20", "ema50": "e50", "ema200": "e200",
     "ema_trend": "et", "atr": "atr", "atr_pct": "atrp",
     "poc": "poc", "poc_strength": "pocs",
-    "premium_discount": "pd", "range_high": "rh", "range_low": "rl",
+    "premium_discount": "pd",
+    "range_high": "rh", "range_low": "rl",
     "equilibrium": "eq", "price_vs_eq_pct": "peq",
     "swing_high": "sh", "swing_low": "sl",
     "swing_high2": "sh2", "swing_low2": "sl2",
     "bos": "bos", "choch": "choch", "bos_level": "bosl",
-    "ob_type": "ob", "ob_top": "obT", "ob_bottom": "obB", "ob_strength": "obs",
-    "ob_list": "obL", "ob_mit": "obM",
+    # Order blocks
+    "ob_type": "ob", "ob_top": "obT", "ob_bottom": "obB",
+    "ob_strength": "obs", "ob_list": "obL", "ob_mit": "obM",
+    # Breaker blocks
     "bb_type": "bb", "bb_top": "bbT", "bb_bottom": "bbB",
+    # FVG
     "fvg_type": "fvg", "fvg_top": "fvgT", "fvg_bottom": "fvgB",
     "fvg_list": "fvgL", "fvg_mit": "fvgM",
+    # Liquidity
     "liquidity_levels": "liq",
     "liq_buy_side": "liqBS", "liq_sell_side": "liqSS",
+    # NEW: Sweeps
+    "sweep_bull": "swB", "sweep_bear": "swS",
+    # NEW: Equal levels
+    "eq_highs": "eqH", "eq_lows": "eqL",
+    # NEW: Sessions
+    "session_hl": "ses",
+    # NEW: Displacement
+    "disp_bull": "dispB", "disp_bear": "dispS",
+    # S/R + divergence
     "sr_levels": "sr", "rsi_div": "rsiDiv", "rv": "rv",
+    # Volume area
     "vah": "vah", "val": "val",
+    # OTE
     "ote_long": "oteL", "ote_short": "oteS",
+    # Last action
     "last_close": "lc", "last_candle_dir": "lcd",
     "recent_highs": "rhi", "recent_lows": "rlo",
 }
@@ -50,7 +69,7 @@ def build_payload(all_symbol_data: List[Dict[str, Any]]) -> str:
     compact = []
     for sym_data in all_symbol_data:
         entry = {}
-        for tf in TIMEFRAMES:                       # ← FIX
+        for tf in TIMEFRAMES:
             tf_data = sym_data.get(tf)
             if tf_data:
                 entry[tf] = _compress(tf_data)
@@ -61,11 +80,11 @@ def build_payload(all_symbol_data: List[Dict[str, Any]]) -> str:
     payload = {
         "market_context": {
             "total_symbols": len(compact),
-            "timeframes":    TIMEFRAMES,            # ← FIX
+            "timeframes":    TIMEFRAMES,
         },
         "data": compact,
     }
     json_str = json.dumps(payload, separators=(",", ":"))
-    logger.info("Payload built: %d symbols, %d chars, TFs=%s",
+    logger.info("Payload: %d symbols, %d chars, TFs=%s",
                 len(compact), len(json_str), TIMEFRAMES)
     return json_str
