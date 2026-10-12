@@ -2,17 +2,17 @@
 Continuous trade monitor with TP1/TP2 partial tracking.
 
 Lifecycle:
-  • TP1 hit  → notify + move SL to breakeven (trade stays open)
-  • TP2 hit  → notify + move SL to TP1 (trade stays open)
-  • TP3 hit  → close with final PnL
-  • SL hit   → close (PnL depends on how many TPs were hit)
+  • TP1 hit → notify, move SL to breakeven (trade stays open)
+  • TP2 hit → notify, move SL to TP1     (trade stays open)
+  • TP3 hit → close (final PnL)
+  • SL hit  → close (with context: raw / breakeven / trailing)
 """
 import asyncio
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -100,9 +100,10 @@ async def add_trade(signal: Dict[str, Any]):
         trades = _load_json(ACTIVE_TRADES_FILE)
         t = dict(signal)
         t["opened_at"] = datetime.utcnow().isoformat()
-        t["status"] = "open"
-        t["tp1_hit"] = False
-        t["tp2_hit"] = False
+        t["status"]    = "open"
+        t["tp1_hit"]   = False
+        t["tp2_hit"]   = False
+        t["tp3_hit"]   = False
         trades.append(t)
         _save_json(ACTIVE_TRADES_FILE, trades)
     logger.info("Trade added: %s", signal["symbol"])
@@ -110,7 +111,10 @@ async def add_trade(signal: Dict[str, Any]):
 
 # ── Exit detection ───────────────────────────────────────────────
 def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
-    """Return SL / TP1 / TP2 / TP3 or None."""
+    """
+    Return SL / TP1 / TP2 / TP3 or None.
+    Order matters: SL is checked first (protective), then TP3, TP2, TP1.
+    """
     d = trade["direction"].upper()
     sl  = float(trade["sl"])
     tp1 = float(trade["tp1"])
@@ -122,7 +126,7 @@ def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
     if d == "LONG":
         if price <= sl:
             return "SL"
-        if not tp2_hit and not trade.get("tp3_hit") and price >= tp3:
+        if not tp2_hit and price >= tp3:
             return "TP3"
         if not tp2_hit and price >= tp2:
             return "TP2"
@@ -131,13 +135,36 @@ def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
     else:  # SHORT
         if price >= sl:
             return "SL"
-        if not tp2_hit and not trade.get("tp3_hit") and price <= tp3:
+        if not tp2_hit and price <= tp3:
             return "TP3"
         if not tp2_hit and price <= tp2:
             return "TP2"
         if not tp1_hit and price <= tp1:
             return "TP1"
     return None
+
+
+def _cascade_tp_flags(t: Dict[str, Any], action: str) -> None:
+    """
+    BUG FIX: If price gaps past multiple TP levels in one cycle,
+    mark the intermediate TPs as hit so the record is consistent.
+    """
+    if action == "TP2":
+        t["tp1_hit"] = True
+        t["tp2_hit"] = True
+    elif action == "TP3":
+        t["tp1_hit"] = True
+        t["tp2_hit"] = True
+        t["tp3_hit"] = True
+
+
+def _sl_context(t: Dict[str, Any]) -> str:
+    """Human-readable suffix describing how SL was positioned."""
+    if t.get("tp2_hit"):
+        return " (trailed to TP1)"
+    if t.get("tp1_hit"):
+        return " (breakeven)"
+    return ""
 
 
 # ── Main loop ────────────────────────────────────────────────────
@@ -160,7 +187,7 @@ async def monitor_loop():
                 await asyncio.sleep(MONITOR_INTERVAL_SEC)
                 continue
 
-            notifications: List[tuple] = []
+            notifications: List[Tuple[Dict[str, Any], str, float]] = []
 
             async with _get_lock():
                 current = _load_json(ACTIVE_TRADES_FILE)
@@ -184,61 +211,67 @@ async def monitor_loop():
 
                     if action == "TP1":
                         t["tp1_hit"] = True
-                        # Move SL to breakeven
-                        t["sl"] = t["entry"]
+                        t["sl"] = t["entry"]          # move to breakeven
                         updated.append(t)
-                        notifications.append((t, "TP1", price, None))
+                        notifications.append((t, "TP1", price))
 
                     elif action == "TP2":
-                        t["tp2_hit"] = True
-                        # Move SL to TP1
-                        t["sl"] = t["tp1"]
+                        _cascade_tp_flags(t, "TP2")
+                        t["sl"] = t["tp1"]            # trail to TP1
                         updated.append(t)
-                        notifications.append((t, "TP2", price, None))
+                        notifications.append((t, "TP2", price))
 
                     else:  # SL or TP3 → close
-                        t["status"] = "closed"
-                        t["closed_at"] = datetime.utcnow().isoformat()
-                        t["exit_price"] = price
+                        if action == "TP3":
+                            _cascade_tp_flags(t, "TP3")
+                        t["status"]      = "closed"
+                        t["closed_at"]   = datetime.utcnow().isoformat()
+                        t["exit_price"]  = price
                         t["exit_reason"] = action
                         pnl = calc_pnl(t, price)
                         t["pnl_pct"] = round(pnl["pnl_pct"], 4)
                         _append_closed(t)
-                        notifications.append((t, action, price, t["pnl_pct"]))
+                        notifications.append((t, action, price))
 
                 _save_json(ACTIVE_TRADES_FILE, updated)
 
             # ── Send notifications outside lock ─────────────────
-            for t, action, price, pnl_pct in notifications:
+            for t, action, price in notifications:
                 sym = t["symbol"]
                 d = t["direction"].upper()
-                entry = float(t["entry"])
 
                 if action in ("TP1", "TP2"):
-                    emoji = "🎯"
-                    extra = ("SL moved to breakeven" if action == "TP1"
-                             else "SL moved to TP1")
                     pnl_now = calc_pnl(t, price)["pnl_pct"]
+                    extra = ("SL → breakeven" if action == "TP1"
+                             else "SL → TP1")
                     await send_raw_message(
-                        f"{emoji} *{action} Hit* — `{sym}` {d}\n"
-                        f"Price: `{price}` | Current PnL: `{pnl_now:+.2f}%`\n"
-                        f"_{extra}_ — trade still open, tracking TP3"
+                        f"🎯 *{action} Hit* — `{sym}` {d}\n"
+                        f"Price: `{price}` | PnL: `{pnl_now:+.2f}%`\n"
+                        f"_{extra}_ — still tracking TP3"
                     )
                     logger.info("%s hit %s @ %s", sym, action, price)
 
-                else:  # SL or TP3 → closed
-                    emoji = "✅" if action == "TP3" else "❌"
+                else:  # SL or TP3
+                    if action == "SL":
+                        emoji = "❌"
+                        reason_str = f"SL{_sl_context(t)}"
+                    else:
+                        emoji = "✅"
+                        reason_str = "TP3"
+
                     tps = []
                     if t.get("tp1_hit"): tps.append("TP1")
                     if t.get("tp2_hit"): tps.append("TP2")
-                    tps_str = f" ({'+'.join(tps)} hit before)" if tps else ""
+                    tps_str = (f" _{'+'.join(tps)} hit before_"
+                               if tps else "")
+                    pnl_pct = t.get("pnl_pct", 0.0)
                     await send_raw_message(
                         f"{emoji} *Trade Closed* — `{sym}` {d}\n"
-                        f"Reason: *{action}* at `{price}`{tps_str}\n"
+                        f"Reason: *{reason_str}* at `{price}`{tps_str}\n"
                         f"PnL: `{pnl_pct:+.2f}%`"
                     )
                     logger.info("Trade closed: %s %s @ %s (%.2f%%)",
-                                sym, action, price, pnl_pct)
+                                sym, reason_str, price, pnl_pct)
 
         except Exception as exc:
             logger.error("Monitor loop error: %s", exc, exc_info=True)
