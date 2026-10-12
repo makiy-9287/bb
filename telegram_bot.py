@@ -266,7 +266,8 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Polling error handler ────────────────────────────────────────
-async def _on_polling_error(exc: Exception) -> None:
+# MUST be a regular function (not async) per python-telegram-bot v21.
+def _on_polling_error(exc: Exception) -> None:
     logger.warning("Telegram polling hiccup: %s — retrying", type(exc).__name__)
 
 
