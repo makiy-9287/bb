@@ -1,6 +1,5 @@
 """
-Fetches top-volume coins and OHLCV data from Binance Futures.
-Concurrency-limited to 10 to avoid rate limits; retries transient errors.
+Binance Futures data fetcher — concurrency-safe with retries.
 """
 import asyncio
 import logging
@@ -17,8 +16,8 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-_CONCURRENCY = 10          # max simultaneous HTTP requests
-_FETCH_RETRIES = 3
+_CONCURRENCY = 10
+_RETRIES     = 3
 
 
 async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
@@ -26,22 +25,18 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=15) as resp:
             data = await resp.json()
-
-    usdt_perps = [
-        t for t in data
-        if t["symbol"].endswith("USDT") and t["symbol"] != "USDCUSDT"
-    ]
-    usdt_perps.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    symbols = [t["symbol"] for t in usdt_perps[:limit]]
-    logger.info("Fetched top %d symbols by volume", len(symbols))
+    usdt = [t for t in data
+            if t["symbol"].endswith("USDT") and t["symbol"] != "USDCUSDT"]
+    usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+    symbols = [t["symbol"] for t in usdt[:limit]]
+    logger.info("Top %d symbols by volume", len(symbols))
     return symbols
 
 
 async def fetch_ohlcv(
     exchange: ccxt.Exchange, symbol: str, timeframe: str,
 ) -> pd.DataFrame:
-    """Fetch OHLCV with retry on transient errors."""
-    for attempt in range(_FETCH_RETRIES):
+    for attempt in range(_RETRIES):
         try:
             raw = await exchange.fetch_ohlcv(
                 symbol, timeframe=timeframe, limit=OHLCV_FETCH_LIMIT
@@ -52,8 +47,8 @@ async def fetch_ohlcv(
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             return df.tail(CANDLE_LIMIT).reset_index(drop=True)
         except Exception as exc:
-            if attempt == _FETCH_RETRIES - 1:
-                logger.warning("OHLCV failed %s %s: %s",
+            if attempt == _RETRIES - 1:
+                logger.warning("OHLCV %s %s failed: %s",
                                symbol, timeframe, exc)
                 return pd.DataFrame()
             await asyncio.sleep(1 + attempt)
@@ -63,14 +58,13 @@ async def fetch_ohlcv(
 async def fetch_all_data(
     symbols: List[str],
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
-    """Fetch OHLCV for every symbol × timeframe (max 10 concurrent)."""
     exchange = ccxt.binance({
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
     })
     sem = asyncio.Semaphore(_CONCURRENCY)
 
-    async def _one(sym: str, tf: str):
+    async def _one(sym, tf):
         async with sem:
             df = await fetch_ohlcv(exchange, sym, tf)
             return sym, tf, df
@@ -89,5 +83,5 @@ async def fetch_all_data(
         bundle.setdefault(sym, {})[tf] = df
 
     await exchange.close()
-    logger.info("Fetched data for %d symbols", len(bundle))
+    logger.info("Fetched %d symbols", len(bundle))
     return bundle
