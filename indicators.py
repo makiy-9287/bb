@@ -595,9 +595,80 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["liq_buy_side"] = out["liq_sell_side"] = []
 
     # ── NEW: Sweeps ─────────────────────────────────────────────
-    sweeps = _detect_liquidity_sweeps(df, shl, atr_val)
-    out["sweep_bull"] = sweeps["bull"]
-    out["sweep_bear"] = sweeps["bear"]
+    def _detect_liquidity_sweeps(
+    df: pd.DataFrame, shl: pd.DataFrame, atr_val: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Detect recent liquidity sweeps.
+
+    Bullish Sweep (LONG trigger):
+      • Candle LOW wicks BELOW a prior swing low
+      • Candle CLOSE is back ABOVE that swing low
+      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
+
+    Bearish Sweep (SHORT trigger):
+      • Candle HIGH wicks ABOVE a prior swing high
+      • Candle CLOSE is back BELOW that swing high
+      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
+
+    BUG FIX: iterate swings NEWEST-first so the reported level is the
+    most recently swept one (not a stale older level).
+    """
+    result: Dict[str, Any] = {"bull": None, "bear": None}
+
+    if (atr_val is None or atr_val <= 0
+            or shl is None or shl.empty or df.empty):
+        return result
+
+    try:
+        n = len(df)
+        start = max(n - SWEEP_LOOKBACK, 1)
+
+        swing_lows  = shl[shl["HighLow"] == -1].dropna(subset=["Level"])
+        swing_highs = shl[shl["HighLow"] == 1].dropna(subset=["Level"])
+
+        for i in range(n - 1, start - 1, -1):
+            candle = df.iloc[i]
+            bars_ago = n - 1 - i
+
+            prior_lows  = swing_lows[swing_lows.index < i]
+            prior_highs = swing_highs[swing_highs.index < i]
+
+            # Bullish sweep — newest swing low first
+            if result["bull"] is None and not prior_lows.empty:
+                for idx in range(len(prior_lows) - 1, -1, -1):
+                    lvl = float(prior_lows["Level"].iloc[idx])
+                    pen = lvl - float(candle["low"])
+                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
+                            and float(candle["close"]) > lvl):
+                        result["bull"] = {
+                            "lvl": _safe_round(lvl),
+                            "pen": _safe_round(pen / atr_val, 2),
+                            "bar": bars_ago,
+                        }
+                        break
+
+            # Bearish sweep — newest swing high first
+            if result["bear"] is None and not prior_highs.empty:
+                for idx in range(len(prior_highs) - 1, -1, -1):
+                    lvl = float(prior_highs["Level"].iloc[idx])
+                    pen = float(candle["high"]) - lvl
+                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
+                            and float(candle["close"]) < lvl):
+                        result["bear"] = {
+                            "lvl": _safe_round(lvl),
+                            "pen": _safe_round(pen / atr_val, 2),
+                            "bar": bars_ago,
+                        }
+                        break
+
+            if result["bull"] and result["bear"]:
+                break
+
+    except Exception as exc:
+        logger.debug("Sweep detection failed: %s", exc)
+
+    return result
 
     # ── NEW: Equal Highs / Lows ─────────────────────────────────
     eq = _detect_equal_levels(shl)
