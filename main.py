@@ -1,6 +1,5 @@
 """
-Main orchestrator — DAY MODE.
-Trading window: 13:00–20:00 SLST (Mon–Thu).
+Main orchestrator — DAY MODE (Mon–Thu, 13:00–20:00 SLST).
 Trade monitor runs 24/7 regardless of window.
 """
 import asyncio
@@ -57,12 +56,16 @@ def _seconds_until_next_window() -> float:
 
 
 def _seconds_to_next_scan_boundary() -> float:
+    """
+    Seconds until the next 15-min boundary (e.g. :00, :15, :30, :45).
+    If we're within 30s of the next boundary (implying we might have just
+    finished a scan), skip to the following boundary to avoid double-firing.
+    """
     now = datetime.now(SLST_TZ)
     m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
     nxt = (now + timedelta(minutes=m)).replace(second=0, microsecond=0)
     wait = (nxt - now).total_seconds()
-    # Guard: if we're within 5s of the boundary, skip to the next one
-    if wait < 5:
+    if wait < 30:
         wait += SCAN_INTERVAL_MIN * 60
     return wait
 
@@ -115,10 +118,12 @@ async def signal_cycle():
 
 
 async def signal_loop():
+    """Sleep until next boundary OR wake early when /scan is triggered.
+    BUG FIX: we clear the event AFTER wait_for returns successfully, so
+    a /scan triggered during a scan is honoured on the next iteration."""
     scan_event: asyncio.Event = AGENT_STATE["scan_trigger"]
 
     while True:
-        scan_event.clear()
         now = datetime.now(SLST_TZ)
         day = DAY_NAMES[now.weekday()]
 
@@ -139,9 +144,28 @@ async def signal_loop():
 
         try:
             await asyncio.wait_for(scan_event.wait(), timeout=wait_sec)
+            # Event was set → clear it and loop immediately
+            scan_event.clear()
             logger.info("🚀 Manual /scan — running now")
         except asyncio.TimeoutError:
             pass
+
+
+async def signal_loop_supervisor():
+    """Restart signal_loop if it crashes completely.
+    BUG FIX: previously a signal_loop crash would leave the whole
+    trading pipeline dead while other tasks kept running."""
+    while True:
+        try:
+            await signal_loop()
+            # signal_loop has `while True`, so this line is unreachable
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Signal loop crashed: %s — restarting in 30s",
+                         exc, exc_info=True)
+            await asyncio.sleep(30)
 
 
 async def main():
@@ -161,7 +185,7 @@ async def main():
     logger.info("Trade monitor runs 24/7 (even outside window)")
 
     results = await asyncio.gather(
-        signal_loop(),
+        signal_loop_supervisor(),
         monitor_loop(),
         telegram_bot_supervisor(),
         return_exceptions=True,
