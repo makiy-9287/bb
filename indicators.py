@@ -1,13 +1,23 @@
 """
 Technical indicators + extended SMC/ICT metrics.
 
-NEW DETECTIONS:
+DETECTIONS:
+  • BOS / CHoCH
+  • Order Blocks (list of 3) + mitigation
+  • Breaker Blocks (former OB broken opposite)
+  • FVG (list of 3) + mitigation
+  • Liquidity levels (buy-side / sell-side)
   • Liquidity sweeps (wick + close-back confirmation)
   • Equal Highs / Equal Lows (EQH / EQL clusters)
   • Session highs/lows (Asian / London / NY, previous UTC day)
   • Displacement candles (large-body institutional moves)
+  • RSI divergence (bullish / bearish)
+  • S/R clusters
+  • POC / VAH / VAL (volume profile)
+  • Premium / Discount / OTE zones
 
-All ta.* calls are guarded; short-history coins don't crash the loop.
+All ta.* calls are guarded with _last() so short-history coins
+(newly-listed, tokenized stocks) don't crash the pipeline.
 """
 import logging
 from typing import Any, Dict, List, Optional
@@ -26,9 +36,12 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
-# ── helpers ──────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  HELPERS
+# ════════════════════════════════════════════════════════════════
 
 def _safe_round(v, decimals: int = 4) -> Optional[float]:
+    """Round safely; None for NaN/inf/None."""
     try:
         if v is None:
             return None
@@ -41,10 +54,13 @@ def _safe_round(v, decimals: int = 4) -> Optional[float]:
 
 
 def _last(series):
+    """Safely extract last value; None if None/empty."""
     if series is None:
         return None
     try:
-        return series.iloc[-1] if len(series) else None
+        if len(series) == 0:
+            return None
+        return series.iloc[-1]
     except Exception:
         return None
 
@@ -54,7 +70,9 @@ def _swing_highs_lows(df: pd.DataFrame) -> pd.DataFrame:
     return smc.swing_highs_lows(ohlc, swing_length=SWING_LENGTH)
 
 
-# ── Liquidity Sweep Detection ────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  LIQUIDITY SWEEP DETECTION  (newest-swing-first)
+# ════════════════════════════════════════════════════════════════
 
 def _detect_liquidity_sweeps(
     df: pd.DataFrame, shl: pd.DataFrame, atr_val: Optional[float],
@@ -63,16 +81,17 @@ def _detect_liquidity_sweeps(
     Detect recent liquidity sweeps.
 
     Bullish Sweep (LONG trigger):
-      - Candle LOW wicks BELOW a prior swing low
-      - Candle CLOSE is back ABOVE that swing low
-      - Wick penetration > SWEEP_PEN_ATR_MIN × ATR (noise filter)
+      • Candle LOW wicks BELOW a prior swing low
+      • Candle CLOSE is back ABOVE that swing low
+      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
 
     Bearish Sweep (SHORT trigger):
-      - Candle HIGH wicks ABOVE a prior swing high
-      - Candle CLOSE is back BELOW that swing high
-      - Wick penetration > SWEEP_PEN_ATR_MIN × ATR
+      • Candle HIGH wicks ABOVE a prior swing high
+      • Candle CLOSE is back BELOW that swing high
+      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
 
-    Returns the most recent confirmed sweep per direction, or None.
+    Iterates swings NEWEST-first so the reported level is the most
+    recently swept one (not a stale older level).
     """
     result: Dict[str, Any] = {"bull": None, "bear": None}
 
@@ -91,16 +110,16 @@ def _detect_liquidity_sweeps(
             candle = df.iloc[i]
             bars_ago = n - 1 - i
 
-            # Only consider swings that completed BEFORE this candle
-            prior_lows = swing_lows[swing_lows.index < i]
+            prior_lows  = swing_lows[swing_lows.index < i]
             prior_highs = swing_highs[swing_highs.index < i]
 
-            # Bullish sweep
+            # ── Bullish sweep — newest swing low first ──────────
             if result["bull"] is None and not prior_lows.empty:
-                for lvl in prior_lows["Level"].tolist():
-                    lvl = float(lvl)
+                for idx in range(len(prior_lows) - 1, -1, -1):
+                    lvl = float(prior_lows["Level"].iloc[idx])
                     pen = lvl - float(candle["low"])
-                    if pen > SWEEP_PEN_ATR_MIN * atr_val and float(candle["close"]) > lvl:
+                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
+                            and float(candle["close"]) > lvl):
                         result["bull"] = {
                             "lvl": _safe_round(lvl),
                             "pen": _safe_round(pen / atr_val, 2),
@@ -108,12 +127,13 @@ def _detect_liquidity_sweeps(
                         }
                         break
 
-            # Bearish sweep
+            # ── Bearish sweep — newest swing high first ─────────
             if result["bear"] is None and not prior_highs.empty:
-                for lvl in prior_highs["Level"].tolist():
-                    lvl = float(lvl)
+                for idx in range(len(prior_highs) - 1, -1, -1):
+                    lvl = float(prior_highs["Level"].iloc[idx])
                     pen = float(candle["high"]) - lvl
-                    if pen > SWEEP_PEN_ATR_MIN * atr_val and float(candle["close"]) < lvl:
+                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
+                            and float(candle["close"]) < lvl):
                         result["bear"] = {
                             "lvl": _safe_round(lvl),
                             "pen": _safe_round(pen / atr_val, 2),
@@ -130,7 +150,9 @@ def _detect_liquidity_sweeps(
     return result
 
 
-# ── Equal Highs / Lows ───────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  EQUAL HIGHS / EQUAL LOWS  (EQH / EQL)
+# ════════════════════════════════════════════════════════════════
 
 def _detect_equal_levels(shl: pd.DataFrame) -> Dict[str, List[Dict]]:
     """
@@ -147,7 +169,7 @@ def _detect_equal_levels(shl: pd.DataFrame) -> Dict[str, List[Dict]]:
         lows = [float(v) for v in
                 shl[shl["HighLow"] == -1]["Level"].dropna().tolist()]
 
-        def cluster(levels: List[float]) -> List[Dict]:
+        def _cluster(levels: List[float]) -> List[Dict]:
             used = [False] * len(levels)
             out = []
             for i in range(len(levels)):
@@ -158,7 +180,8 @@ def _detect_equal_levels(shl: pd.DataFrame) -> Dict[str, List[Dict]]:
                 for j in range(i + 1, len(levels)):
                     if used[j]:
                         continue
-                    if abs(levels[j] - levels[i]) / levels[i] < EQUAL_LEVEL_TOL:
+                    if (abs(levels[j] - levels[i]) / levels[i]
+                            < EQUAL_LEVEL_TOL):
                         group.append(levels[j])
                         used[j] = True
                 if len(group) >= 2:
@@ -166,15 +189,17 @@ def _detect_equal_levels(shl: pd.DataFrame) -> Dict[str, List[Dict]]:
                     out.append({"lvl": _safe_round(avg), "n": len(group)})
             return out
 
-        result["eqh"] = cluster(highs)[:3]
-        result["eql"] = cluster(lows)[:3]
+        result["eqh"] = _cluster(highs)[:3]
+        result["eql"] = _cluster(lows)[:3]
     except Exception as exc:
         logger.debug("EQH/EQL failed: %s", exc)
 
     return result
 
 
-# ── Session Highs / Lows ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  SESSION HIGHS / LOWS  (Asia / London / NY, previous UTC day)
+# ════════════════════════════════════════════════════════════════
 
 def _detect_session_extremes(df: pd.DataFrame) -> Dict[str, Any]:
     """
@@ -189,7 +214,6 @@ def _detect_session_extremes(df: pd.DataFrame) -> Dict[str, Any]:
 
     try:
         last_ts = df["ts"].iloc[-1]
-        # Previous UTC day start (00:00 of previous day)
         prev_day = (last_ts - pd.Timedelta(days=1)).normalize()
         df_prev = df[df["ts"] >= prev_day]
         if df_prev.empty:
@@ -201,7 +225,8 @@ def _detect_session_extremes(df: pd.DataFrame) -> Dict[str, Any]:
             "ny":     (13, 21),
         }
         for name, (sh, eh) in sessions.items():
-            mask = (df_prev["ts"].dt.hour >= sh) & (df_prev["ts"].dt.hour < eh)
+            mask = ((df_prev["ts"].dt.hour >= sh)
+                    & (df_prev["ts"].dt.hour < eh))
             sub = df_prev[mask]
             if not sub.empty:
                 out[name] = {
@@ -214,7 +239,9 @@ def _detect_session_extremes(df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 
-# ── Displacement Candles ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  DISPLACEMENT CANDLES
+# ════════════════════════════════════════════════════════════════
 
 def _detect_displacement(
     df: pd.DataFrame, atr_val: Optional[float],
@@ -255,7 +282,9 @@ def _detect_displacement(
     return out
 
 
-# ── Breaker Block Detection ──────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  BREAKER BLOCKS
+# ════════════════════════════════════════════════════════════════
 
 def _detect_breaker_blocks(df: pd.DataFrame, ob_df) -> Dict[str, Any]:
     """
@@ -268,6 +297,7 @@ def _detect_breaker_blocks(df: pd.DataFrame, ob_df) -> Dict[str, Any]:
     try:
         if ob_df is None or ob_df.empty or df.empty:
             return result
+
         valid = ob_df[ob_df["OB"] != 0].dropna(subset=["Top", "Bottom"])
         if valid.empty:
             return result
@@ -281,10 +311,13 @@ def _detect_breaker_blocks(df: pd.DataFrame, ob_df) -> Dict[str, Any]:
             ob_top = float(row["Top"])
             ob_bottom = float(row["Bottom"])
 
-            # Position in the original df index
+            # Position of this OB inside the original dataframe
             ob_pos = valid.index[i]
             if not isinstance(ob_pos, (int, np.integer)):
-                ob_pos = int(valid.index[i]) if str(valid.index[i]).isdigit() else i
+                try:
+                    ob_pos = int(ob_pos)
+                except Exception:
+                    ob_pos = i
             if ob_pos >= n or ob_pos < 0:
                 continue
 
@@ -305,10 +338,13 @@ def _detect_breaker_blocks(df: pd.DataFrame, ob_df) -> Dict[str, Any]:
 
     except Exception as exc:
         logger.debug("BB detection failed: %s", exc)
+
     return result
 
 
-# ── S/R Clustering ───────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  S/R CLUSTERING
+# ════════════════════════════════════════════════════════════════
 
 def _detect_sr_levels(
     shl: pd.DataFrame, current_price: float,
@@ -334,7 +370,8 @@ def _detect_sr_levels(
             for j in range(i + 1, len(points)):
                 if j in used:
                     continue
-                if abs(points[j]["price"] - pt["price"]) / pt["price"] < 0.005:
+                if (abs(points[j]["price"] - pt["price"]) / pt["price"]
+                        < 0.005):
                     group.append(points[j])
                     used.add(j)
             avg = sum(g["price"] for g in group) / len(group)
@@ -354,19 +391,25 @@ def _detect_sr_levels(
         return []
 
 
-# ── RSI Divergence ───────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  RSI DIVERGENCE
+# ════════════════════════════════════════════════════════════════
 
-def _detect_rsi_divergence(df: pd.DataFrame, rsi_series) -> Optional[str]:
+def _detect_rsi_divergence(
+    df: pd.DataFrame, rsi_series,
+) -> Optional[str]:
     try:
         if rsi_series is None or len(rsi_series) < 20:
             return None
         n = len(df)
         highs, lows = [], []
         for i in range(max(1, n - 30), n - 1):
-            h, hm, hp = (df["high"].iloc[i], df["high"].iloc[i-1],
-                         df["high"].iloc[i+1])
-            l, lm, lp = (df["low"].iloc[i], df["low"].iloc[i-1],
-                         df["low"].iloc[i+1])
+            h, hm, hp = (df["high"].iloc[i],
+                         df["high"].iloc[i - 1],
+                         df["high"].iloc[i + 1])
+            l, lm, lp = (df["low"].iloc[i],
+                         df["low"].iloc[i - 1],
+                         df["low"].iloc[i + 1])
             if h > hm and h > hp:
                 highs.append((i, float(h), float(rsi_series.iloc[i])))
             if l < lm and l < lp:
@@ -385,7 +428,9 @@ def _detect_rsi_divergence(df: pd.DataFrame, rsi_series) -> Optional[str]:
         return None
 
 
-# ── Value Area ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  VALUE AREA  (VAH / VAL, 70% of volume)
+# ════════════════════════════════════════════════════════════════
 
 def _compute_value_area(price_bins, vol_profile, total_vol, pct=0.70):
     try:
@@ -405,9 +450,12 @@ def _compute_value_area(price_bins, vol_profile, total_vol, pct=0.70):
         return None, None
 
 
-# ── Main Indicator Block ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+#  MAIN INDICATOR BLOCK
+# ════════════════════════════════════════════════════════════════
 
 def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    """Compute all indicators for a single timeframe DataFrame."""
     if df.empty or len(df) < 30:
         return {}
 
@@ -434,7 +482,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["ema_trend"] = None
 
     atr_val = _last(ta.atr(high, low, close, length=14))
-    out["atr"]     = _safe_round(atr_val)
+    out["atr"] = _safe_round(atr_val)
     out["atr_pct"] = (_safe_round(atr_val / close.iloc[-1] * 100, 2)
                       if atr_val and close.iloc[-1] else None)
 
@@ -461,9 +509,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     rh, rl = high.tail(50).max(), low.tail(50).min()
     eq = (rh + rl) / 2
     out["premium_discount"] = (
-        "premium"    if close.iloc[-1] > eq else
-        "discount"   if close.iloc[-1] < eq else
-        "equilibrium"
+        "premium" if close.iloc[-1] > eq
+        else "discount" if close.iloc[-1] < eq
+        else "equilibrium"
     )
     out["range_high"] = _safe_round(rh)
     out["range_low"]  = _safe_round(rl)
@@ -504,7 +552,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # ── BOS / CHoCH ─────────────────────────────────────────────
     try:
         bc = smc.bos_choch(ohlc, shl, close_break=True)
-        bv, cv, lv = bc["BOS"].dropna(), bc["CHOCH"].dropna(), bc["Level"].dropna()
+        bv = bc["BOS"].dropna()
+        cv = bc["CHOCH"].dropna()
+        lv = bc["Level"].dropna()
         out["bos"]       = int(bv.iloc[-1]) if not bv.empty else 0
         out["choch"]     = int(cv.iloc[-1]) if not cv.empty else 0
         out["bos_level"] = _safe_round(lv.iloc[-1]) if not lv.empty else None
@@ -523,9 +573,10 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             out["ob_top"]    = _safe_round(last["Top"])
             out["ob_bottom"] = _safe_round(last["Bottom"])
             pct = last.get("Percentage")
-            out["ob_strength"] = _safe_round(pct, 2) if pct is not None else None
+            out["ob_strength"] = (_safe_round(pct, 2)
+                                  if pct is not None else None)
             out["ob_list"] = [
-                {"t": "bull" if ob_valid.iloc[i]["OB"] == 1 else "bear",
+                {"t":   "bull" if ob_valid.iloc[i]["OB"] == 1 else "bear",
                  "top": _safe_round(ob_valid.iloc[i]["Top"]),
                  "bot": _safe_round(ob_valid.iloc[i]["Bottom"])}
                 for i in range(len(ob_valid) - 1,
@@ -550,14 +601,16 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # ── FVG ─────────────────────────────────────────────────────
     try:
         fvg_df = smc.fvg(ohlc, join_consecutive=False)
-        fvg_valid = fvg_df[fvg_df["FVG"] != 0].dropna(subset=["Top", "Bottom"])
+        fvg_valid = fvg_df[fvg_df["FVG"] != 0].dropna(
+            subset=["Top", "Bottom"]
+        )
         if not fvg_valid.empty:
             last = fvg_valid.iloc[-1]
             out["fvg_type"]   = "bull" if last["FVG"] == 1 else "bear"
             out["fvg_top"]    = _safe_round(last["Top"])
             out["fvg_bottom"] = _safe_round(last["Bottom"])
             out["fvg_list"] = [
-                {"t": "bull" if fvg_valid.iloc[i]["FVG"] == 1 else "bear",
+                {"t":   "bull" if fvg_valid.iloc[i]["FVG"] == 1 else "bear",
                  "top": _safe_round(fvg_valid.iloc[i]["Top"]),
                  "bot": _safe_round(fvg_valid.iloc[i]["Bottom"])}
                 for i in range(len(fvg_valid) - 1,
@@ -579,7 +632,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # ── Liquidity ───────────────────────────────────────────────
     try:
         liq_df = smc.liquidity(ohlc, shl, range_percent=LIQUIDITY_RANGE_PCT)
-        liq_valid = liq_df[liq_df["Liquidity"] != 0].dropna(subset=["Level"])
+        liq_valid = liq_df[liq_df["Liquidity"] != 0].dropna(
+            subset=["Level"]
+        )
         cp = close.iloc[-1]
         bs, ss, all_lv = [], [], []
         if not liq_valid.empty:
@@ -594,101 +649,31 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["liquidity_levels"] = []
         out["liq_buy_side"] = out["liq_sell_side"] = []
 
-    # ── NEW: Sweeps ─────────────────────────────────────────────
-    def _detect_liquidity_sweeps(
-    df: pd.DataFrame, shl: pd.DataFrame, atr_val: Optional[float],
-) -> Dict[str, Any]:
-    """
-    Detect recent liquidity sweeps.
+    # ── Liquidity Sweeps ────────────────────────────────────────
+    sweeps = _detect_liquidity_sweeps(df, shl, atr_val)
+    out["sweep_bull"] = sweeps["bull"]
+    out["sweep_bear"] = sweeps["bear"]
 
-    Bullish Sweep (LONG trigger):
-      • Candle LOW wicks BELOW a prior swing low
-      • Candle CLOSE is back ABOVE that swing low
-      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
-
-    Bearish Sweep (SHORT trigger):
-      • Candle HIGH wicks ABOVE a prior swing high
-      • Candle CLOSE is back BELOW that swing high
-      • Wick penetration > SWEEP_PEN_ATR_MIN × ATR
-
-    BUG FIX: iterate swings NEWEST-first so the reported level is the
-    most recently swept one (not a stale older level).
-    """
-    result: Dict[str, Any] = {"bull": None, "bear": None}
-
-    if (atr_val is None or atr_val <= 0
-            or shl is None or shl.empty or df.empty):
-        return result
-
-    try:
-        n = len(df)
-        start = max(n - SWEEP_LOOKBACK, 1)
-
-        swing_lows  = shl[shl["HighLow"] == -1].dropna(subset=["Level"])
-        swing_highs = shl[shl["HighLow"] == 1].dropna(subset=["Level"])
-
-        for i in range(n - 1, start - 1, -1):
-            candle = df.iloc[i]
-            bars_ago = n - 1 - i
-
-            prior_lows  = swing_lows[swing_lows.index < i]
-            prior_highs = swing_highs[swing_highs.index < i]
-
-            # Bullish sweep — newest swing low first
-            if result["bull"] is None and not prior_lows.empty:
-                for idx in range(len(prior_lows) - 1, -1, -1):
-                    lvl = float(prior_lows["Level"].iloc[idx])
-                    pen = lvl - float(candle["low"])
-                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
-                            and float(candle["close"]) > lvl):
-                        result["bull"] = {
-                            "lvl": _safe_round(lvl),
-                            "pen": _safe_round(pen / atr_val, 2),
-                            "bar": bars_ago,
-                        }
-                        break
-
-            # Bearish sweep — newest swing high first
-            if result["bear"] is None and not prior_highs.empty:
-                for idx in range(len(prior_highs) - 1, -1, -1):
-                    lvl = float(prior_highs["Level"].iloc[idx])
-                    pen = float(candle["high"]) - lvl
-                    if (pen > SWEEP_PEN_ATR_MIN * atr_val
-                            and float(candle["close"]) < lvl):
-                        result["bear"] = {
-                            "lvl": _safe_round(lvl),
-                            "pen": _safe_round(pen / atr_val, 2),
-                            "bar": bars_ago,
-                        }
-                        break
-
-            if result["bull"] and result["bear"]:
-                break
-
-    except Exception as exc:
-        logger.debug("Sweep detection failed: %s", exc)
-
-    return result
-
-    # ── NEW: Equal Highs / Lows ─────────────────────────────────
+    # ── Equal Highs / Lows ──────────────────────────────────────
     eq = _detect_equal_levels(shl)
     out["eq_highs"] = eq["eqh"]
     out["eq_lows"]  = eq["eql"]
 
-    # ── NEW: Session extremes ───────────────────────────────────
+    # ── Session extremes ────────────────────────────────────────
     out["session_hl"] = _detect_session_extremes(df)
 
-    # ── NEW: Displacement ───────────────────────────────────────
+    # ── Displacement ────────────────────────────────────────────
     disp = _detect_displacement(df, atr_val)
     out["disp_bull"] = disp["bull"]
     out["disp_bear"] = disp["bear"]
 
-    # ── S/R + RSI divergence + rel volume ───────────────────────
+    # ── S/R + RSI divergence + relative volume ──────────────────
     out["sr_levels"] = _detect_sr_levels(shl, close.iloc[-1])
     out["rsi_div"]   = _detect_rsi_divergence(df, rsi_series)
     try:
         avg20 = vol.tail(20).mean()
-        out["rv"] = _safe_round(vol.iloc[-1] / avg20, 2) if avg20 > 0 else None
+        out["rv"] = (_safe_round(vol.iloc[-1] / avg20, 2)
+                     if avg20 > 0 else None)
     except Exception:
         out["rv"] = None
 
@@ -696,15 +681,22 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     out["last_close"]      = _safe_round(close.iloc[-1])
     out["last_candle_dir"] = ("bull" if close.iloc[-1] > df["open"].iloc[-1]
                               else "bear")
-    out["recent_highs"]    = [_safe_round(v) for v in high.tail(5).tolist()]
-    out["recent_lows"]     = [_safe_round(v) for v in low.tail(5).tolist()]
+    out["recent_highs"]    = [_safe_round(v)
+                              for v in high.tail(5).tolist()]
+    out["recent_lows"]     = [_safe_round(v)
+                              for v in low.tail(5).tolist()]
 
     return out
 
 
+# ════════════════════════════════════════════════════════════════
+#  MULTI-TIMEFRAME WRAPPER
+# ════════════════════════════════════════════════════════════════
+
 def compute_multi_timeframe(
     symbol: str, data: Dict[str, pd.DataFrame],
 ) -> Dict[str, Any]:
+    """Compute indicators for all timeframes of one symbol."""
     result = {"symbol": symbol}
     for tf, df in data.items():
         try:
