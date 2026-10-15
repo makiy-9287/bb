@@ -99,17 +99,7 @@ Optimal Trade Entry (OTE) = 0.618 to 0.79 retracement of the range.
 
 ## SL / TP — USE EXACT PRICES FROM RAW CANDLES
 
-### Minimum SL distance (mandatory floor)
-Calculate SL from structure, but WIDEN to the floor if structure SL is
-closer than these minimums:
-  BTC / ETH                    → 0.6% of entry
-  Major alts (SOL, BNB, XRP,   → 1.0% of entry
-   DOGE, ADA, AVAX, LINK, TON,
-   SUI, APT, NEAR, DOT)
-  Mid-cap alts                 → 1.5% of entry
-  Low-price alts (< $1)        → 2.0% of entry
-  Meme coins (DOGE, PEPE,      → 2.5% of entry
-   WIF, BONK, FLOKI, 1000X)
+
 
 ### SL placement
 - Place SL 3-5 ticks beyond the sweep low/high OR the OB edge OR the
