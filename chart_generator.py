@@ -1,8 +1,6 @@
 """
-Chart generator — produces 1920×1080 candlestick charts with
-MA(7,25,99) + RSI + Volume, using mplfinance.
-
-Multiprocessing-aware: safe to call from asyncio via run_in_executor.
+Chart generator — 1920×1080 PNG with MA(7,25,99) + RSI + Volume.
+Optimized PNG compression + file size validation.
 """
 import logging
 import os
@@ -15,25 +13,23 @@ import pandas as pd
 
 from config import (
     CHARTS_DIR, CHART_WIDTH_PX, CHART_HEIGHT_PX,
-    CHART_DPI, CHART_WORKERS, CHART_CLEANUP,
+    CHART_DPI, CHART_WORKERS, CHART_MAX_FILE_KB,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ── Worker function (must be top-level for pickling) ─────────────
+# ── Worker (top-level for pickling) ──────────────────────────────
 def _generate_single_chart(args: Tuple) -> Optional[str]:
-    """
-    Worker: generate one chart. Runs in a separate process.
-    args = (symbol, timeframe, df_dict, output_path)
-    """
+    """Worker: generate one chart in an isolated process."""
+    symbol, timeframe, df_dict, output_path = args
+
+    # Local imports (required inside worker for ProcessPoolExecutor)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import mplfinance as mpf
     import pandas_ta_classic as ta
-
-    symbol, timeframe, df_dict, output_path = args
 
     try:
         df = pd.DataFrame(df_dict)
@@ -49,11 +45,14 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df = df.tail(300)
 
-        # Indicators
         ma7  = ta.sma(df["Close"], length=7)
         ma25 = ta.sma(df["Close"], length=25)
         ma99 = ta.sma(df["Close"], length=99)
         rsi  = ta.rsi(df["Close"], length=14)
+
+        # Horizontal RSI guide lines (constant series)
+        rsi_70 = pd.Series(70, index=df.index)
+        rsi_30 = pd.Series(30, index=df.index)
 
         apds = [
             mpf.make_addplot(ma7,  panel=0, color="#f0b90b", width=1.2),
@@ -61,13 +60,12 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
             mpf.make_addplot(ma99, panel=0, color="#9c27b0", width=1.2),
             mpf.make_addplot(rsi,  panel=2, color="#f0b90b", width=1.2,
                              ylabel="RSI", ylim=(0, 100)),
-            mpf.make_addplot(pd.Series(70, index=df.index), panel=2,
-                             color="#f6465d", linestyle="--", width=0.8),
-            mpf.make_addplot(pd.Series(30, index=df.index), panel=2,
-                             color="#0ecb81", linestyle="--", width=0.8),
+            mpf.make_addplot(rsi_70, panel=2, color="#f6465d",
+                             linestyle="--", width=0.8),
+            mpf.make_addplot(rsi_30, panel=2, color="#0ecb81",
+                             linestyle="--", width=0.8),
         ]
 
-        # Binance dark theme
         mc = mpf.make_marketcolors(
             up="#0ecb81", down="#f6465d",
             edge={"up": "#0ecb81", "down": "#f6465d"},
@@ -98,35 +96,46 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
             volume=True,
             addplot=apds,
             panel_ratios=(6, 2, 2),
-            figsize=(CHART_WIDTH_PX / CHART_DPI, CHART_HEIGHT_PX / CHART_DPI),
+            figsize=(CHART_WIDTH_PX / CHART_DPI,
+                     CHART_HEIGHT_PX / CHART_DPI),
             dpi=CHART_DPI,
             title=f"{symbol}  |  {timeframe.upper()}",
             tight_layout=True,
             savefig=dict(fname=output_path, dpi=CHART_DPI,
-                         bbox_inches="tight", pad_inches=0.1),
+                         bbox_inches="tight", pad_inches=0.1,
+                         optimize=True),
         )
         plt.close("all")
+
+        # Validate file size
+        if not os.path.exists(output_path):
+            return None
+        size_kb = os.path.getsize(output_path) / 1024
+        if size_kb > CHART_MAX_FILE_KB:
+            logger.warning("Chart too big (%.0f KB) — rejecting %s %s",
+                           size_kb, symbol, timeframe)
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+            return None
         return output_path
 
     except Exception as exc:
         logger.warning("Chart %s %s failed: %s", symbol, timeframe, exc)
         try:
-            import matplotlib.pyplot as plt
             plt.close("all")
         except Exception:
             pass
         return None
 
 
-# ── Public API ───────────────────────────────────────────────────
+# ── Manager ──────────────────────────────────────────────────────
 class ChartManager:
-    """Manages chart generation, storage, and cleanup per cycle."""
-
     def __init__(self):
         self._current_dir: Optional[str] = None
 
     def new_cycle_dir(self) -> str:
-        """Create a fresh temp folder for the current cycle."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(CHARTS_DIR, ts)
         os.makedirs(path, exist_ok=True)
@@ -134,7 +143,6 @@ class ChartManager:
         return path
 
     def cleanup(self, cycle_dir: Optional[str] = None):
-        """Delete charts after agent responds."""
         target = cycle_dir or self._current_dir
         if not target or not os.path.isdir(target):
             return
@@ -148,7 +156,6 @@ class ChartManager:
                 self._current_dir = None
 
     def startup_cleanup(self):
-        """Remove ALL old chart folders on startup."""
         try:
             if not os.path.isdir(CHARTS_DIR):
                 return
@@ -161,19 +168,17 @@ class ChartManager:
             logger.warning("Startup cleanup failed: %s", exc)
 
 
+chart_manager = ChartManager()
+
+
 async def generate_all_charts(
     bundle: Dict[str, Dict[str, pd.DataFrame]],
     symbols: List[str],
     cycle_dir: str,
 ) -> Dict[str, List[str]]:
-    """
-    Generate all charts for the given symbols using multiprocessing.
-
-    Returns: {symbol: [chart_path_4h, chart_path_1h, chart_path_15m]}
-    """
     import asyncio
 
-    tasks_specs = []
+    tasks_specs: List[Tuple] = []
     output_map: Dict[str, List[str]] = {}
 
     for symbol in symbols:
@@ -188,7 +193,8 @@ async def generate_all_charts(
             out_path = os.path.join(cycle_dir, f"{symbol}_{tf}.png")
             df_records = df.to_dict(orient="records")
             for rec in df_records:
-                rec["ts"] = rec["ts"].isoformat() if hasattr(rec["ts"], "isoformat") else rec["ts"]
+                ts = rec.get("ts")
+                rec["ts"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
             tasks_specs.append((symbol, tf, df_records, out_path))
             output_map[symbol].append(out_path)
 
@@ -214,11 +220,8 @@ async def generate_all_charts(
                   if not isinstance(r, Exception) and r is not None)
     logger.info("Charts generated: %d/%d", success, len(tasks_specs))
 
-    # Verify files exist
-    for sym, paths in output_map.items():
-        output_map[sym] = [p for p in paths if os.path.exists(p)]
+    # Drop failed paths from output_map
+    for sym in list(output_map.keys()):
+        output_map[sym] = [p for p in output_map[sym] if os.path.exists(p)]
 
     return output_map
-
-
-chart_manager = ChartManager()
