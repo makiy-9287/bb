@@ -13,7 +13,8 @@ from smartmoneyconcepts import smc
 from config import (
     SWING_LENGTH, LIQUIDITY_RANGE_PCT, POC_BINS,
     SWEEP_LOOKBACK, SWEEP_PEN_ATR_MIN, EQUAL_LEVEL_TOL,
-    DISPLACEMENT_ATR_MULT,
+    DISPLACEMENT_ATR_MULT, CHART_RAW_CANDLES,   # ← ADD THIS
+
 )
 
 logger = logging.getLogger(__name__)
@@ -514,8 +515,8 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     out["recent_highs"]    = [_safe_round(v) for v in high.tail(5).tolist()]
     out["recent_lows"]     = [_safe_round(v) for v in low.tail(5).tolist()]
 
-    # Raw candles for exact SL/TP reference (last 20)
-    out["raw_candles"] = _extract_raw_candles(df)
+       # Raw candles for exact SL/TP reference
+    out["raw_candles"] = _extract_raw_candles(df, n=CHART_RAW_CANDLES)
 
     return out
 
