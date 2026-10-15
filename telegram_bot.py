@@ -1,5 +1,5 @@
 """
-Telegram command bot with resilient polling.
+Telegram command bot — /start /help /status /trades /pnl /scan.
 """
 import asyncio
 import logging
@@ -94,8 +94,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update,
             "🤖 *Agent Commands*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "/status — agent health & schedule\n"
-            "/trades — active trades + live PnL\n"
+            "/status — agent health\n"
+            "/trades — active trades\n"
             "/pnl    — performance summary\n"
             "/scan   — trigger manual scan\n"
             "/help   — this message"
@@ -104,8 +104,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update,
             f"👋 *Welcome!*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Your Telegram Chat ID:\n"
-            f"`{chat.id}`\n\n"
+            f"Your Telegram Chat ID:\n`{chat.id}`\n\n"
             f"Send this to the bot admin."
         )
 
@@ -132,19 +131,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _in_window(now):
         m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
         next_evt = f"next scan in {m}m"
-        status_line = "🟢 *ACTIVE* — scanning"
+        status_line = "🟢 *ACTIVE*"
     elif now.weekday() in OFF_WEEKDAYS:
         wait_s = (_next_window_start(now) - now).total_seconds()
-        next_evt = f"next Mon {SLST_START.strftime('%H:%M')} in {_fmt_dur(wait_s)}"
-        status_line = "😴 *OFF-DAY* (Fri/Sat/Sun)"
+        next_evt = f"next Mon in {_fmt_dur(wait_s)}"
+        status_line = "😴 *OFF-DAY*"
     else:
-        if now.time() < SLST_START:
-            wait_s = (now.replace(hour=SLST_START.hour,
-                                  minute=SLST_START.minute,
-                                  second=0, microsecond=0) - now
-                      ).total_seconds()
-        else:
-            wait_s = (_next_window_start(now) - now).total_seconds()
+        wait_s = (_next_window_start(now) - now).total_seconds()
         next_evt = f"next window in {_fmt_dur(wait_s)}"
         status_line = "⏸ *OUTSIDE HOURS*"
 
@@ -257,7 +250,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _on_polling_error(exc: Exception) -> None:
-    """MUST be a regular function per python-telegram-bot v21."""
+    """MUST be a regular function (not async) per python-telegram-bot v21."""
     logger.warning("Telegram polling hiccup: %s — retrying", type(exc).__name__)
 
 
