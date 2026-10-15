@@ -1,5 +1,5 @@
 """
-Binance Futures data fetcher — concurrency-safe with retries.
+Binance Futures data fetcher — concurrency-limited, retry-safe.
 """
 import asyncio
 import logging
@@ -10,8 +10,8 @@ import ccxt.async_support as ccxt
 import pandas as pd
 
 from config import (
-    BINANCE_FUTURES_REST, TOP_COINS_LIMIT, CANDLE_LIMIT,
-    OHLCV_FETCH_LIMIT, TIMEFRAMES,
+    BINANCE_FUTURES_REST, TOP_COINS_LIMIT,
+    MAX_CANDLES, TIMEFRAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,12 +21,7 @@ _RETRIES     = 3
 
 
 async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
-    """
-    Fetch top-volume USDT-margined perpetuals with quality filters:
-      • 24h quote volume >= $50M
-      • 24h trade count >= 200K (filters fake volume)
-      • Excludes tokenized stocks
-    """
+    """Top USDT perpetuals by volume, filtered for real liquidity."""
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/24hr"
     try:
         async with aiohttp.ClientSession() as session:
@@ -45,7 +40,7 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
 
     MIN_VOLUME_USD  = 50_000_000
     MIN_TRADE_COUNT = 200_000
-    TOKENIZED_STOCKS = {
+    TOKENIZED = {
         "AAPLUSDT", "MSFTUSDT", "GOOGLUSDT", "AMZNUSDT", "METAUSDT",
         "NVDAUSDT", "TSLAUSDT", "NFLXUSDT", "AMDUSDT", "COINUSDT",
         "MSTRUSDT", "SPCXUSDT", "PLTRUSDT", "CRCLUSDT", "HOODUSDT",
@@ -59,7 +54,7 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
-        if sym in BLACKLIST or sym in TOKENIZED_STOCKS:
+        if sym in BLACKLIST or sym in TOKENIZED:
             continue
         try:
             vol = float(t.get("quoteVolume", 0))
@@ -76,25 +71,23 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
 
     filtered.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     symbols = [t["symbol"] for t in filtered[:limit]]
-    logger.info("Top %d symbols (vol≥$50M, trades≥200K) — sample: %s",
-                len(symbols), symbols[:5])
+    logger.info("Top %d symbols — sample: %s", len(symbols), symbols[:5])
     return symbols
 
 
 async def fetch_ohlcv(
     exchange: ccxt.Exchange, symbol: str, timeframe: str,
 ) -> pd.DataFrame:
-    """Fetch OHLCV with retry on transient errors."""
     for attempt in range(_RETRIES):
         try:
             raw = await exchange.fetch_ohlcv(
-                symbol, timeframe=timeframe, limit=OHLCV_FETCH_LIMIT
+                symbol, timeframe=timeframe, limit=MAX_CANDLES
             )
             df = pd.DataFrame(
                 raw, columns=["ts", "open", "high", "low", "close", "volume"]
             )
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            return df.tail(CANDLE_LIMIT).reset_index(drop=True)
+            return df
         except Exception as exc:
             if attempt == _RETRIES - 1:
                 logger.warning("OHLCV %s %s: %s", symbol, timeframe, exc)
