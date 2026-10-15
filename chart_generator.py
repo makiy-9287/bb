@@ -50,7 +50,7 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
         ma99 = ta.sma(df["Close"], length=99)
         rsi  = ta.rsi(df["Close"], length=14)
 
-        # Horizontal RSI guide lines (constant series)
+        # Horizontal RSI guide lines
         rsi_70 = pd.Series(70, index=df.index)
         rsi_30 = pd.Series(30, index=df.index)
 
@@ -135,7 +135,7 @@ class ChartManager:
     def __init__(self):
         self._current_dir: Optional[str] = None
 
-        def new_cycle_dir(self, tag: str = "") -> str:
+    def new_cycle_dir(self, tag: str = "") -> str:
         """Create a fresh temp folder. Tag = short label for logging."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         name = f"{ts}_{tag}" if tag else ts
