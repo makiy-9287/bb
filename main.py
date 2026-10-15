@@ -1,6 +1,8 @@
 """
-Main orchestrator — DAY MODE (Mon–Thu, 13:00–20:00 SLST).
-Trade monitor runs 24/7 regardless of window.
+v3 Main orchestrator — Hybrid vision + text system.
+
+Scan window: 12:00–20:00 SLST (Mon–Thu), every 15 min.
+Trade monitor: 24/7, every 5s.
 """
 import asyncio
 import logging
@@ -9,11 +11,15 @@ from datetime import datetime, timedelta, timezone
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
-    TOP_COINS_LIMIT, REASONING_EFFORT, DEEPSEEK_MODEL,
+    TOP_COINS_LIMIT, CHART_COIN_LIMIT,
+    REASONING_EFFORT, DEEPSEEK_MODEL,
     SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
+from chart_generator import (
+    generate_all_charts, chart_manager,
+)
 from payload_builder import build_payload
 from agent import run_agent
 from trade_monitor import monitor_loop, add_trade
@@ -28,6 +34,7 @@ logging.basicConfig(
 logging.getLogger("pandas_ta_classic").setLevel(logging.ERROR)
 logging.getLogger("pandas_ta_classic.utils.core").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
@@ -56,11 +63,6 @@ def _seconds_until_next_window() -> float:
 
 
 def _seconds_to_next_scan_boundary() -> float:
-    """
-    Seconds until the next 15-min boundary (e.g. :00, :15, :30, :45).
-    If we're within 30s of the next boundary (implying we might have just
-    finished a scan), skip to the following boundary to avoid double-firing.
-    """
     now = datetime.now(SLST_TZ)
     m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
     nxt = (now + timedelta(minutes=m)).replace(second=0, microsecond=0)
@@ -78,10 +80,18 @@ def _fmt_sleep(s: float) -> str:
 
 async def signal_cycle():
     logger.info("═══ Signal cycle starting ═══")
+
+    # 1. Fetch symbols
     symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
+    if not symbols:
+        logger.warning("No symbols — skipping cycle")
+        return
+
+    # 2. Fetch OHLCV
     logger.info("Fetching OHLCV for %d symbols …", len(symbols))
     bundle = await fetch_all_data(symbols)
 
+    # 3. Compute indicators
     logger.info("Computing indicators …")
     all_data = []
     for sym, tf_data in bundle.items():
@@ -94,33 +104,45 @@ async def signal_cycle():
         logger.warning("No data — skipping cycle")
         return
 
+    # 4. Build text payload
     payload = build_payload(all_data)
     logger.info("Payload size: %.1f KB", len(payload) / 1024)
 
+    # 5. Generate charts for top N coins
+    cycle_dir = chart_manager.new_cycle_dir()
+    chart_symbols = symbols[:CHART_COIN_LIMIT]
+    chart_map = await generate_all_charts(bundle, chart_symbols, cycle_dir)
+
+    # 6. Send to DeepSeek
     logger.info("Sending to DeepSeek (model=%s, effort=%s) …",
                 DEEPSEEK_MODEL, REASONING_EFFORT)
-    signal = await run_agent(payload)
+    signal = await run_agent(payload, chart_map)
 
+    # 7. Cleanup charts
+    chart_manager.cleanup(cycle_dir)
+
+    # 8. Update state
     update_state(
         last_scan_at=datetime.now(SLST_TZ),
         scan_count=AGENT_STATE["scan_count"] + 1,
     )
 
+    # 9. Handle signal
     if signal:
-        await add_trade(signal)
-        update_state(
-            last_signal=signal,
-            signal_count=AGENT_STATE["signal_count"] + 1,
-        )
-        logger.info("Signal registered: %s", signal["symbol"])
+        added = await add_trade(signal)
+        if added:
+            update_state(
+                last_signal=signal,
+                signal_count=AGENT_STATE["signal_count"] + 1,
+            )
+            logger.info("Signal registered: %s", signal["symbol"])
+        else:
+            logger.info("Signal skipped — max positions")
     else:
         logger.info("No valid setup this cycle")
 
 
 async def signal_loop():
-    """Sleep until next boundary OR wake early when /scan is triggered.
-    BUG FIX: we clear the event AFTER wait_for returns successfully, so
-    a /scan triggered during a scan is honoured on the next iteration."""
     scan_event: asyncio.Event = AGENT_STATE["scan_trigger"]
 
     while True:
@@ -144,7 +166,6 @@ async def signal_loop():
 
         try:
             await asyncio.wait_for(scan_event.wait(), timeout=wait_sec)
-            # Event was set → clear it and loop immediately
             scan_event.clear()
             logger.info("🚀 Manual /scan — running now")
         except asyncio.TimeoutError:
@@ -152,19 +173,14 @@ async def signal_loop():
 
 
 async def signal_loop_supervisor():
-    """Restart signal_loop if it crashes completely.
-    BUG FIX: previously a signal_loop crash would leave the whole
-    trading pipeline dead while other tasks kept running."""
     while True:
         try:
             await signal_loop()
-            # signal_loop has `while True`, so this line is unreachable
             return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Signal loop crashed: %s — restarting in 30s",
-                         exc, exc_info=True)
+            logger.error("Signal loop crashed: %s — restart in 30s", exc)
             await asyncio.sleep(30)
 
 
@@ -172,17 +188,22 @@ async def main():
     update_state(started_at=datetime.now(SLST_TZ))
     AGENT_STATE["scan_trigger"] = asyncio.Event()
 
+    # Cleanup old charts from previous runs
+    chart_manager.startup_cleanup()
+
     logger.info("╔══════════════════════════════════════════╗")
-    logger.info("║  Binance Futures AI Agent — DAY MODE    ║")
+    logger.info("║  Binance Futures AI Agent — v3 HYBRID   ║")
     logger.info("╚══════════════════════════════════════════╝")
     logger.info("Model: %s | Reasoning: %s", DEEPSEEK_MODEL, REASONING_EFFORT)
     logger.info("Timeframes: 4H + 1H + 15m | Coins: %d", TOP_COINS_LIMIT)
-    logger.info("Candles: 400 | Scan interval: %d min", SCAN_INTERVAL_MIN)
+    logger.info("Candles: 300 | Charts: %d coins × 3 TFs", CHART_COIN_LIMIT)
+    logger.info("Chart size: 1920×1080 @ 100 DPI")
+    logger.info("Scan interval: %d min", SCAN_INTERVAL_MIN)
     logger.info("Trading days: Monday – Thursday")
     logger.info("Trading hours: %s – %s SLST",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
     logger.info("Off days: Friday, Saturday, Sunday")
-    logger.info("Trade monitor runs 24/7 (even outside window)")
+    logger.info("Trade monitor: 24/7 (5s interval)")
 
     results = await asyncio.gather(
         signal_loop_supervisor(),
