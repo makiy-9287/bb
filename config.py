@@ -39,6 +39,11 @@ TIMEFRAMES = ["4h", "1h", "15m"]
 # ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
 
+# ── Batching ─────────────────────────────────────────────────────
+# Send coins to DeepSeek in chunks to stay under API payload limits.
+# 20 coins × 3 TFs = 60 charts ≈ ~15-18 MB base64 per request.
+BATCH_SIZE = 20
+
 # ── Chart Generation ─────────────────────────────────────────────
 CHART_COIN_LIMIT   = 40
 CHART_WORKERS      = 3
