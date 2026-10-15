@@ -210,6 +210,17 @@ async def run_agent(
         logger.info("🧠 Reasoning (%d chars): %s …", len(reasoning), preview)
         _save_reasoning(reasoning)
 
+        # ── Log token usage ─────────────────────────────────────────
+    try:
+        usage = response.usage
+        if usage:
+            logger.info("📊 Tokens — prompt: %d, completion: %d, total: %d",
+                        usage.prompt_tokens or 0,
+                        usage.completion_tokens or 0,
+                        usage.total_tokens or 0)
+    except Exception:
+        pass
+
     if not msg.tool_calls:
         content_str = (msg.content or "").strip()
         if content_str:
