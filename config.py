@@ -29,40 +29,40 @@ TELEGRAM_BROADCAST_IDS = _ids
 
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 40          # v3: 40 coins
-CANDLE_LIMIT         = 300         # v3: 300 candles per TF
-OHLCV_FETCH_LIMIT    = 499         # fetch more for EMA200 buffer
+TOP_COINS_LIMIT      = 40
+CANDLE_LIMIT         = 300
+OHLCV_FETCH_LIMIT    = 499
 
 # ── Timeframes ───────────────────────────────────────────────────
 TIMEFRAMES = ["4h", "1h", "15m"]
 
 # ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
-SCAN_WINDOW_START = 12            # 12:00 SLST
-SCAN_WINDOW_END   = 20            # 20:00 SLST
 
 # ── Chart Generation ─────────────────────────────────────────────
-CHART_COIN_LIMIT   = 40           # generate charts for these many coins
-CHART_WORKERS      = 3            # parallel chart generation processes
+CHART_COIN_LIMIT   = 40
+CHART_WORKERS      = 3
 CHART_WIDTH_PX     = 1920
 CHART_HEIGHT_PX    = 1080
 CHART_DPI          = 100
-CHART_CLEANUP      = True         # auto-delete after each cycle
-CHART_RAW_CANDLES  = 20           # raw candles in text payload for SL/TP
-CHART_TIMEOUT_SEC  = 180          # max time for all chart generation
+CHART_CLEANUP      = True
+CHART_RAW_CANDLES  = 20            # now actually used in indicators.py
+CHART_TIMEOUT_SEC  = 240           # hard cap for chart generation phase
+CHART_MAX_FILE_KB  = 450           # reject individual charts larger than this
+CHART_MAX_TOTAL_MB = 25            # log warning if total base64 exceeds this
 
 # ── SMC / Liquidity Tuning ───────────────────────────────────────
-SWING_LENGTH        = 20
-LIQUIDITY_RANGE_PCT = 0.01
-POC_BINS            = 50
-SWEEP_LOOKBACK      = 30
-SWEEP_PEN_ATR_MIN   = 0.15
-EQUAL_LEVEL_TOL     = 0.001
+SWING_LENGTH          = 20
+LIQUIDITY_RANGE_PCT   = 0.01
+POC_BINS              = 50
+SWEEP_LOOKBACK        = 30
+SWEEP_PEN_ATR_MIN     = 0.15
+EQUAL_LEVEL_TOL       = 0.001
 DISPLACEMENT_ATR_MULT = 1.5
 
 # ── Trade Management ─────────────────────────────────────────────
-MAX_ACTIVE_TRADES    = 3          # max concurrent positions
-MONITOR_INTERVAL_SEC = 5          # v3: 5s for fast SL
+MAX_ACTIVE_TRADES    = 3
+MONITOR_INTERVAL_SEC = 5
 ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
 
@@ -77,6 +77,6 @@ OFF_WEEKDAYS     = {4, 5, 6}
 DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Paths ────────────────────────────────────────────────────────
-DATA_DIR    = "data"
-CHARTS_DIR  = os.path.join(DATA_DIR, "charts")
+DATA_DIR   = "data"
+CHARTS_DIR = os.path.join(DATA_DIR, "charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
