@@ -1,8 +1,7 @@
 """
-Telegram broadcast sender — all recipients in TELEGRAM_BROADCAST_IDS.
+Telegram broadcast sender — multi-recipient.
 """
 import logging
-from typing import Any
 
 import aiohttp
 
@@ -51,8 +50,7 @@ async def _send(text: str) -> bool:
                 logger.error("Telegram %s exception: %s", chat_id, exc)
 
     if fail:
-        logger.warning("Broadcast: %d ok, %d fail (of %d)",
-                       ok, fail, len(TELEGRAM_BROADCAST_IDS))
+        logger.warning("Broadcast: %d ok, %d fail", ok, fail)
     else:
         logger.info("Broadcast delivered to %d", ok)
     return ok > 0
