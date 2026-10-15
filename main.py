@@ -1,19 +1,23 @@
 """
-v4 Main orchestrator — Pure raw candles.
+v4.1 Main orchestrator — Single-request mode.
+
+All 40 coins + raw candles sent in ONE DeepSeek call.
+No batching, no charts.
+
 Scan window: 12:00–20:00 SLST (Mon–Thu), every 15 min.
+Trade monitor: 24/7, every 5s.
 """
 import asyncio
 import logging
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
     TOP_COINS_LIMIT, REASONING_EFFORT, DEEPSEEK_MODEL,
-    SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES, BATCH_SIZE,
-    CANDLE_COUNTS,
+    SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
+    CANDLE_COUNTS, MONITOR_INTERVAL_SEC,
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
@@ -34,9 +38,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
-_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
 
 
+# ── Time helpers ─────────────────────────────────────────────────
 def in_execution_window() -> bool:
     now = datetime.now(SLST_TZ)
     if now.weekday() in OFF_WEEKDAYS:
@@ -75,90 +79,30 @@ def _fmt_sleep(s: float) -> str:
     return f"{int(s // 60)}m"
 
 
-def _signal_score(sig: Dict[str, Any]) -> tuple:
-    conf = _CONFIDENCE_RANK.get(sig.get("confidence", "low"), 1)
-    try:
-        entry = float(sig["entry"])
-        sl = float(sig["sl"])
-        tp3 = float(sig["tp3"])
-        risk = abs(entry - sl)
-        reward = abs(tp3 - entry)
-        rr = reward / risk if risk > 0 else 0.0
-    except Exception:
-        rr = 0.0
-    return (conf, rr)
-
-
-def _pick_best_signal(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return max(signals, key=_signal_score)
-
-
-async def process_batch(
-    batch_num: int,
-    total_batches: int,
-    batch_symbols: List[str],
-    all_data: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    prefix = f"[Batch {batch_num}/{total_batches}]"
-    t0 = time.time()
-
-    logger.info("%s ━━━ START — %d coins ━━━", prefix, len(batch_symbols))
-    logger.info("%s Coins: %s", prefix, ", ".join(batch_symbols))
-
-    try:
-        batch_data = [d for d in all_data if d["symbol"] in batch_symbols]
-        if not batch_data:
-            logger.warning("%s No indicator data — skipping", prefix)
-            return None
-
-        logger.info("%s Building payload for %d symbols …",
-                    prefix, len(batch_data))
-        payload = build_payload(batch_data)
-        logger.info("%s Payload: %.1f KB", prefix, len(payload) / 1024)
-
-        header = (f"=== BATCH {batch_num}/{total_batches} — "
-                  f"{len(batch_data)} coins ===\n\n")
-        logger.info("%s Sending to DeepSeek …", prefix)
-        t_api = time.time()
-        signal = await run_agent(header + payload)
-        logger.info("%s Agent response in %.1fs", prefix, time.time() - t_api)
-
-        if signal:
-            logger.info("%s ✅ Signal: %s %s (%s)",
-                        prefix, signal["direction"], signal["symbol"],
-                        signal.get("confidence"))
-        else:
-            logger.info("%s ✗ No setup", prefix)
-
-        logger.info("%s ━━━ END in %.1fs ━━━", prefix, time.time() - t0)
-        return signal
-
-    except Exception as exc:
-        logger.error("%s Crashed: %s", prefix, exc, exc_info=True)
-        return None
-
-
+# ── Signal cycle ─────────────────────────────────────────────────
 async def signal_cycle():
     cycle_start = time.time()
     logger.info("═══ Signal cycle starting ═══")
 
     try:
-        # 1. Symbols
+        # Step 1 — Fetch symbols
         logger.info("Step 1/4 — Fetching top symbols …")
+        t = time.time()
         symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
         if not symbols:
             logger.warning("No symbols — cycle aborted")
             return
-        logger.info("Step 1/4 — Done: %d symbols", len(symbols))
+        logger.info("Step 1/4 — Done: %d symbols in %.1fs",
+                    len(symbols), time.time() - t)
 
-        # 2. OHLCV
-        logger.info("Step 2/4 — Fetching OHLCV …")
+        # Step 2 — OHLCV
+        logger.info("Step 2/4 — Fetching OHLCV (4H/1H/15m) …")
         t = time.time()
         bundle = await fetch_all_data(symbols)
         logger.info("Step 2/4 — Done: %d symbols in %.1fs",
                     len(bundle), time.time() - t)
 
-        # 3. Indicators
+        # Step 3 — Indicators
         logger.info("Step 3/4 — Computing indicators …")
         t = time.time()
         all_data = []
@@ -174,40 +118,38 @@ async def signal_cycle():
             logger.warning("No data — cycle aborted")
             return
 
-        # 4. Batches
-        batches = [symbols[i:i + BATCH_SIZE]
-                   for i in range(0, len(symbols), BATCH_SIZE)]
-        logger.info("Step 4/4 — %d batches of ≤%d coins",
-                    len(batches), BATCH_SIZE)
+        # Step 4 — Single payload + single request
+        logger.info("Step 4/4 — Building single payload for %d coins …",
+                    len(all_data))
+        payload = build_payload(all_data)
+        logger.info("Payload: %.1f KB", len(payload) / 1024)
 
-        signals: List[Dict[str, Any]] = []
-        for i, batch in enumerate(batches, 1):
-            sig = await process_batch(i, len(batches), batch, all_data)
-            if sig:
-                signals.append(sig)
+        logger.info("Sending to DeepSeek (model=%s, effort=%s) …",
+                    DEEPSEEK_MODEL, REASONING_EFFORT)
+        t = time.time()
+        signal = await run_agent(payload)
+        logger.info("Agent response in %.1fs", time.time() - t)
 
-        logger.info("━━━ Cycle summary ━━━")
-        logger.info("Batches: %d | Signals: %d", len(batches), len(signals))
-
+        # Update state
         update_state(
             last_scan_at=datetime.now(SLST_TZ),
             scan_count=AGENT_STATE["scan_count"] + 1,
         )
 
-        if signals:
-            best = _pick_best_signal(signals)
-            logger.info("🏆 Best: %s %s (%s)",
-                        best["direction"], best["symbol"],
-                        best.get("confidence"))
-            added = await add_trade(best)
+        # Handle signal
+        if signal:
+            logger.info("✅ Signal: %s %s (%s)",
+                        signal["direction"], signal["symbol"],
+                        signal.get("confidence"))
+            added = await add_trade(signal)
             if added:
                 update_state(
-                    last_signal=best,
+                    last_signal=signal,
                     signal_count=AGENT_STATE["signal_count"] + 1,
                 )
-                logger.info("✓ Trade registered: %s", best["symbol"])
+                logger.info("✓ Trade registered: %s", signal["symbol"])
             else:
-                logger.info("✗ Skipped — max positions")
+                logger.info("✗ Skipped — max positions reached")
         else:
             logger.info("✗ No valid setup this cycle")
 
@@ -219,6 +161,7 @@ async def signal_cycle():
                     time.time() - cycle_start)
 
 
+# ── Signal loop ──────────────────────────────────────────────────
 async def signal_loop():
     scan_event: asyncio.Event = AGENT_STATE["scan_trigger"]
 
@@ -238,8 +181,8 @@ async def signal_loop():
                 logger.info("[%s] OFF-DAY — sleeping %s",
                             day, _fmt_sleep(wait_sec))
             else:
-                logger.info("[%s] Outside hours — sleeping %s",
-                            day, _fmt_sleep(wait_sec))
+                logger.info("[%s] Outside hours (%s SLST) — sleeping %s",
+                            day, now.strftime("%H:%M"), _fmt_sleep(wait_sec))
 
         try:
             await asyncio.wait_for(scan_event.wait(), timeout=wait_sec)
@@ -250,6 +193,7 @@ async def signal_loop():
 
 
 async def signal_loop_supervisor():
+    """Restart signal_loop if it crashes unexpectedly."""
     while True:
         try:
             await signal_loop()
@@ -257,28 +201,29 @@ async def signal_loop_supervisor():
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Loop crashed: %s — restart in 30s", exc)
+            logger.error("Signal loop crashed: %s — restart in 30s", exc)
             await asyncio.sleep(30)
 
 
+# ── Main ─────────────────────────────────────────────────────────
 async def main():
     update_state(started_at=datetime.now(SLST_TZ))
     AGENT_STATE["scan_trigger"] = asyncio.Event()
 
     logger.info("╔══════════════════════════════════════════════╗")
-    logger.info("║  Binance Futures AI Agent — v4 RAW CANDLES  ║")
+    logger.info("║  Binance Futures AI Agent — v4.1 SINGLE     ║")
     logger.info("╚══════════════════════════════════════════════╝")
     logger.info("Model: %s | Reasoning: %s", DEEPSEEK_MODEL, REASONING_EFFORT)
     logger.info("Timeframes: 4H(%d) + 1H(%d) + 15m(%d) candles",
-                CANDLE_COUNTS["4h"], CANDLE_COUNTS["1h"],
-                CANDLE_COUNTS["15m"])
-    logger.info("Coins: %d | Batch size: %d", TOP_COINS_LIMIT, BATCH_SIZE)
-    logger.info("Mode: Raw candles + RSI/MA/ATR — no charts")
+                CANDLE_COUNTS["4h"], CANDLE_COUNTS["1h"], CANDLE_COUNTS["15m"])
+    logger.info("Coins: %d | Mode: SINGLE REQUEST (no batches)",
+                TOP_COINS_LIMIT)
+    logger.info("Data: Raw candles + RSI/MA/ATR — no charts")
     logger.info("Trading days: Monday – Thursday")
     logger.info("Trading hours: %s – %s SLST",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
     logger.info("Off days: Friday, Saturday, Sunday")
-    logger.info("Trade monitor: 24/7 (%ds interval)", MONITOR_INTERVAL_SEC if False else 5)
+    logger.info("Trade monitor: 24/7 (%ds interval)", MONITOR_INTERVAL_SEC)
 
     results = await asyncio.gather(
         signal_loop_supervisor(),
