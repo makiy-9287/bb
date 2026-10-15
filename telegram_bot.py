@@ -21,7 +21,6 @@ from config import (
 logger = logging.getLogger(__name__)
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
 
-# Silence library loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
@@ -87,7 +86,6 @@ async def _reply(update: Update, text: str) -> None:
         logger.warning("Reply failed: %s", exc)
 
 
-# ── Handlers ─────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
@@ -108,7 +106,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Your Telegram Chat ID:\n"
             f"`{chat.id}`\n\n"
-            f"Send this to the bot admin to receive signals."
+            f"Send this to the bot admin."
         )
 
 
@@ -178,18 +176,15 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     from trade_monitor import get_active_trades, get_prices, calc_pnl
-
     trades = get_active_trades()
     if not trades:
         await _reply(update, "📭 No active trades.")
         return
-
     symbols = list({t["symbol"] for t in trades})
     try:
         prices = await get_prices(symbols)
     except Exception:
         prices = {}
-
     lines = ["📊 *Active Trades*", "━━━━━━━━━━━━━━━━━━━━"]
     for t in trades:
         sym, d = t["symbol"], t["direction"].upper()
@@ -215,12 +210,10 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     from trade_monitor import get_closed_trades
-
     closed = get_closed_trades()
     if not closed:
         await _reply(update, "📭 No closed trades yet.")
         return
-
     wins = losses = 0
     total = 0.0
     best = worst = None
@@ -236,12 +229,10 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         losses += 1 if pct < 0 else 0
         if best is None or pct > best[0]:  best = (pct, t)
         if worst is None or pct < worst[0]: worst = (pct, t)
-
     n = wins + losses
     wr = (wins / n * 100) if n else 0
     b_str = f"+{best[0]:.2f}% ({best[1]['symbol']})" if best else "—"
     w_str = f"{worst[0]:.2f}% ({worst[1]['symbol']})" if worst else "—"
-
     await _reply(update,
         f"📈 *Performance Summary*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -265,13 +256,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply(update, "🚀 Manual scan triggered.")
 
 
-# ── Polling error handler ────────────────────────────────────────
-# MUST be a regular function (not async) per python-telegram-bot v21.
 def _on_polling_error(exc: Exception) -> None:
+    """MUST be a regular function per python-telegram-bot v21."""
     logger.warning("Telegram polling hiccup: %s — retrying", type(exc).__name__)
 
 
-# ── Bot lifecycle ────────────────────────────────────────────────
 async def telegram_bot_loop():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set — bot disabled")
@@ -284,7 +273,6 @@ async def telegram_bot_loop():
         write_timeout=30.0,
         pool_timeout=30.0,
     )
-
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -292,7 +280,6 @@ async def telegram_bot_loop():
         .get_updates_request(request)
         .build()
     )
-
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
