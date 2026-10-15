@@ -135,9 +135,11 @@ class ChartManager:
     def __init__(self):
         self._current_dir: Optional[str] = None
 
-    def new_cycle_dir(self) -> str:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(CHARTS_DIR, ts)
+        def new_cycle_dir(self, tag: str = "") -> str:
+        """Create a fresh temp folder. Tag = short label for logging."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        name = f"{ts}_{tag}" if tag else ts
+        path = os.path.join(CHARTS_DIR, name)
         os.makedirs(path, exist_ok=True)
         self._current_dir = path
         return path
