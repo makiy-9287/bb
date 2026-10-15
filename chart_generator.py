@@ -1,11 +1,14 @@
 """
 Chart generator — 1920×1080 PNG with MA(7,25,99) + RSI + Volume.
-Optimized PNG compression + file size validation.
+
+Uses SERIAL execution in a background thread (NOT ProcessPoolExecutor)
+to avoid fork-safety issues with matplotlib + pandas_ta_classic.
 """
+import asyncio
 import logging
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -13,27 +16,33 @@ import pandas as pd
 
 from config import (
     CHARTS_DIR, CHART_WIDTH_PX, CHART_HEIGHT_PX,
-    CHART_DPI, CHART_WORKERS, CHART_MAX_FILE_KB,
+    CHART_DPI, CHART_MAX_FILE_KB,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ── Worker (top-level for pickling) ──────────────────────────────
+# ── Worker ───────────────────────────────────────────────────────
 def _generate_single_chart(args: Tuple) -> Optional[str]:
-    """Worker: generate one chart in an isolated process."""
+    """Generate one chart. Runs in a worker thread (same process)."""
     symbol, timeframe, df_dict, output_path = args
 
-    # Local imports (required inside worker for ProcessPoolExecutor)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import mplfinance as mpf
-    import pandas_ta_classic as ta
+    # Import matplotlib once, safely
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
+        import pandas_ta_classic as ta
+    except Exception as exc:
+        logger.error("Chart worker import failed: %s", exc)
+        return None
 
     try:
         df = pd.DataFrame(df_dict)
         if df.empty or len(df) < 30:
+            logger.debug("Chart %s %s: insufficient data (%d rows)",
+                         symbol, timeframe, len(df))
             return None
 
         df["ts"] = pd.to_datetime(df["ts"])
@@ -45,10 +54,16 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df = df.tail(300)
 
+        # Indicators
         ma7  = ta.sma(df["Close"], length=7)
         ma25 = ta.sma(df["Close"], length=25)
         ma99 = ta.sma(df["Close"], length=99)
         rsi  = ta.rsi(df["Close"], length=14)
+
+        if ma7 is None or ma25 is None or ma99 is None or rsi is None:
+            logger.debug("Chart %s %s: indicator returned None",
+                         symbol, timeframe)
+            return None
 
         # Horizontal RSI guide lines
         rsi_70 = pd.Series(70, index=df.index)
@@ -107,23 +122,27 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
         )
         plt.close("all")
 
-        # Validate file size
         if not os.path.exists(output_path):
+            logger.warning("Chart file not written: %s", output_path)
             return None
+
         size_kb = os.path.getsize(output_path) / 1024
         if size_kb > CHART_MAX_FILE_KB:
-            logger.warning("Chart too big (%.0f KB) — rejecting %s %s",
+            logger.warning("Chart too big (%.0f KB) — reject %s %s",
                            size_kb, symbol, timeframe)
             try:
                 os.remove(output_path)
             except Exception:
                 pass
             return None
+
         return output_path
 
     except Exception as exc:
-        logger.warning("Chart %s %s failed: %s", symbol, timeframe, exc)
+        logger.warning("Chart %s %s failed: %s", symbol, timeframe, exc,
+                       exc_info=False)
         try:
+            import matplotlib.pyplot as plt
             plt.close("all")
         except Exception:
             pass
@@ -173,13 +192,18 @@ class ChartManager:
 chart_manager = ChartManager()
 
 
+# ── Public API ───────────────────────────────────────────────────
 async def generate_all_charts(
     bundle: Dict[str, Dict[str, pd.DataFrame]],
     symbols: List[str],
     cycle_dir: str,
 ) -> Dict[str, List[str]]:
-    import asyncio
+    """
+    Generate all charts SERIALLY in a worker thread.
 
+    Serial execution avoids matplotlib fork-safety issues and keeps
+    timing predictable (~1.5s per chart). 60 charts ≈ 90 seconds.
+    """
     tasks_specs: List[Tuple] = []
     output_map: Dict[str, List[str]] = {}
 
@@ -201,28 +225,34 @@ async def generate_all_charts(
             output_map[symbol].append(out_path)
 
     if not tasks_specs:
+        logger.warning("No chart specs to generate")
         return output_map
 
-    loop = asyncio.get_event_loop()
-    logger.info("Generating %d charts (workers=%d) …",
-                len(tasks_specs), CHART_WORKERS)
+    logger.info("Generating %d charts serially …", len(tasks_specs))
+    t0 = time.time()
+    success = 0
+    failures = 0
 
-    try:
-        with ProcessPoolExecutor(max_workers=CHART_WORKERS) as executor:
-            futures = [
-                loop.run_in_executor(executor, _generate_single_chart, spec)
-                for spec in tasks_specs
-            ]
-            results = await asyncio.gather(*futures, return_exceptions=True)
-    except Exception as exc:
-        logger.error("Chart generation pool failed: %s", exc)
-        return output_map
+    for i, spec in enumerate(tasks_specs, 1):
+        try:
+            result = await asyncio.to_thread(_generate_single_chart, spec)
+            if result and os.path.exists(result):
+                success += 1
+                if success % 10 == 0:
+                    logger.info("  … %d/%d charts done (%.1fs elapsed)",
+                                success, len(tasks_specs),
+                                time.time() - t0)
+            else:
+                failures += 1
+        except Exception as exc:
+            failures += 1
+            logger.warning("Chart task %d failed: %s", i, exc)
 
-    success = sum(1 for r in results
-                  if not isinstance(r, Exception) and r is not None)
-    logger.info("Charts generated: %d/%d", success, len(tasks_specs))
+    elapsed = time.time() - t0
+    logger.info("Charts generated: %d/%d in %.1fs (%d failed)",
+                success, len(tasks_specs), elapsed, failures)
 
-    # Drop failed paths from output_map
+    # Prune missing paths from output_map
     for sym in list(output_map.keys()):
         output_map[sym] = [p for p in output_map[sym] if os.path.exists(p)]
 
