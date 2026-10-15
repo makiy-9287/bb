@@ -1,13 +1,14 @@
 """
-DeepSeek agent — strict 5-confirmation SMC/ICT filter with
-extended liquidity analysis.
+DeepSeek Flash vision agent — hybrid text + charts.
+Model: deepseek-flash (native vision, 384 tokens/image, max 600 images).
 """
 import asyncio
+import base64
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -23,83 +24,39 @@ client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 _API_RETRIES = 3
 
 
-SYSTEM_PROMPT = """You are an elite crypto futures day trader specialising in SMC/ICT,
-liquidity, support/resistance, and premium/discount strategies.
+SYSTEM_PROMPT = """You are an ICT/SMC liquidity trader for Binance Futures day trading.
 
-You receive a compact JSON payload for the top 50 Binance Futures coins.
-Each coin has 4H, 1H, and 15m sections.
+## STRATEGY (only these — ignore everything else)
+- Order Blocks (OB), Fair Value Gaps (FVG), Breaker Blocks (BB)
+- Break of Structure (BOS), Change of Character (CHoCH)
+- Liquidity sweeps, Equal Highs/Lows, Session extremes
+- Premium/Discount zones, OTE (0.618–0.79)
 
-## Task
-Find the BEST trade setup across all coins. Emit AT MOST one signal per cycle.
-If no valid setup exists, reply exactly "NO_SETUP".
+## ENTRY — ALL 5 must align
+1. BOS/CHoCH aligned on 2+ timeframes
+2. Price in discount (LONG) or premium (SHORT)
+3. OB or FVG or BB confluence nearby
+4. Recent liquidity sweep (swB or swS with bar ≤ 8)
+5. RSI supportive (not overbought for LONG / oversold for SHORT)
 
-## MANDATORY 5-Confirmation Rule
-A signal is ONLY valid when ALL 5 confirmations align:
-  1. Market structure (BOS/CHoCH) aligned across 2+ timeframes
-  2. Price in discount (for LONG) or premium (for SHORT)
-  3. Order Block OR FVG confluence nearby
-  4. Liquidity sweep confirmation (see swB / swS below)
-  5. RSI supportive (not overbought for LONG / oversold for SHORT)
+## SL / TP — use EXACT prices from the raw candles
+- SL: just beyond the nearest liquidity pool that invalidates the setup
+  (swept low/high, OB edge, swing point, bb edge)
+- TP1: nearest opposing liquidity level
+- TP2: next S/R cluster or 2R
+- TP3: 3R or opposite-side liquidity
 
-If ANY confirmation is missing, reply "NO_SETUP". Do NOT force trades.
+## RULES
+- Both LONG and SHORT allowed — pick whichever has the confluence
+- Charts (4H, 1H, 15m) give you the visual context: study sweeps, wicks,
+  displacement, and structure at the right edge of each chart
+- The `raw` field in the payload gives 20 exact candles per TF — use
+  these for precise SL/TP prices
+- If no valid setup exists: reply exactly NO_SETUP. Do not force trades.
 
-## LIQUIDITY SWEEP — CRITICAL for confirmation #4
-The payload gives you confirmed sweeps:
-  swB = most recent bullish sweep (wick below prior swing low, closed back above)
-        → {lvl: swept level, pen: wick penetration in ATR multiples, bar: candles ago}
-  swS = most recent bearish sweep (wick above prior swing high, closed back below)
-
-VALIDATION rules for confirmation #4:
-  - For LONG: require swB present AND bar <= 8 (swept within last ~2 hours on 15m)
-  - For SHORT: require swS present AND bar <= 8
-  - Ignore sweeps older than 8 bars — they are stale.
-  - Higher pen (0.5+) indicates stronger institutional rejection.
-
-## SL/TP Rules (CRITICAL)
-SL placement (in priority order):
-  1. For LONG: below the nearest structure level that invalidates the setup
-     (recent swing low, OB bottom, BB bottom, or swept low)
-  2. For SHORT: above the nearest structure level
-  3. Add buffer = 0.2 × ATR beyond the structure
-  4. Absolute minimum SL distance from entry:
-     BTC / ETH   : 0.6% of entry
-     Major alts  : 0.9% (SOL, BNB, XRP, DOGE, ADA, AVAX, LINK, TON)
-     Other alts  : 1.2%
-
-TP placement:
-  TP1: nearest opposing liquidity level OR 1R (whichever is FARTHER)
-  TP2: next S/R cluster OR 2R (whichever is FARTHER)
-  TP3: opposite-side liquidity (liqBS for LONG) OR 3R (whichever is FARTHER)
-
-IMPORTANT: The bot auto-moves SL to breakeven after TP1 and to TP1 after
-TP2. So TP1 should be positioned where partial profit is meaningful, and
-TP3 should be a realistic final target.
-
-## Confidence Tier
-  - All 5 aligned + 4H trend strongly directional   → "high"
-  - All 5 aligned + 4H trend moderate                → "medium"
-  - All 5 aligned but 15m entry imperfect            → "low"
-
-## Field Reference
-bb / bbT / bbB    = Breaker Block (former OB broken opposite direction)
-obL / fvgL        = top 3 recent Order Blocks / FVGs
-obM / fvgM        = mitigation status (yes = price already tapped)
-liqBS / liqSS     = buy-side / sell-side liquidity levels
-sr                = top 5 S/R clusters {p: price, t: type, n: tests, dist: %}
-rsiDiv            = RSI divergence (bull/bear)
-rv                = relative volume vs 20-period avg
-vah / val         = Value Area High/Low (70% of volume)
-oteL / oteS       = Optimal Trade Entry zones
-swB / swS         = liquidity sweeps (see above)
-eqH / eqL         = equal highs / equal lows (high-prob liquidity zones)
-ses               = session H/L from previous UTC day
-                    {asia:{h,l}, london:{h,l}, ny:{h,l}}
-dispB / dispS     = displacement candles {body: ATR multiple, bar: candles ago}
-sh2 / sl2         = second-to-last swing high / low
-
-## Discipline
-Quality over quantity. A cycle with no signal is perfectly acceptable.
-Emit reason as a concise confluence summary (max 120 chars)."""
+## OUTPUT
+Use the send_trade_signal tool. The `reason` field must be a concise
+confluence summary (max 120 chars)."""
 
 
 TOOLS = [{
@@ -143,6 +100,19 @@ def _build_request_kwargs() -> dict:
     return kwargs
 
 
+def _encode_chart(path: str) -> Optional[str]:
+    """Base64-encode a PNG chart as a data URL."""
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception as exc:
+        logger.warning("Chart encode failed %s: %s", path, exc)
+        return None
+
+
 def _save_reasoning(reasoning: str):
     try:
         os.makedirs("debug_reasoning", exist_ok=True)
@@ -153,14 +123,38 @@ def _save_reasoning(reasoning: str):
         logger.warning("Could not save reasoning: %s", e)
 
 
-async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
+async def run_agent(
+    payload_json: str,
+    chart_map: Dict[str, List[str]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Send payload + charts to DeepSeek. chart_map = {symbol: [paths]}.
+    """
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY missing")
         return None
 
+    # Build multimodal content blocks
+    content: List[Dict[str, Any]] = [
+        {"type": "text", "text": f"Market data:\n{payload_json}"},
+    ]
+
+    chart_count = 0
+    for symbol, paths in chart_map.items():
+        for path in paths:
+            url = _encode_chart(path)
+            if url:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                })
+                chart_count += 1
+
+    logger.info("Sending %d charts + text to DeepSeek …", chart_count)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Market data:\n{payload_json}"},
+        {"role": "user", "content": content},
     ]
 
     response = None
@@ -172,7 +166,7 @@ async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
             break
         except Exception as exc:
             if attempt == _API_RETRIES - 1:
-                logger.error("DeepSeek API failed after %d attempts: %s",
+                logger.error("DeepSeek failed after %d attempts: %s",
                              _API_RETRIES, exc)
                 return None
             wait = 2 ** attempt
@@ -192,9 +186,9 @@ async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
         _save_reasoning(reasoning)
 
     if not msg.tool_calls:
-        content = (msg.content or "").strip()
-        if content:
-            logger.info("Agent reply: %s", content[:200])
+        content_str = (msg.content or "").strip()
+        if content_str:
+            logger.info("Agent reply: %s", content_str[:200])
         else:
             logger.info("Agent NO_SETUP (reasoning=%d chars)",
                         len(reasoning) if reasoning else 0)
