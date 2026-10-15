@@ -1,6 +1,5 @@
 """
 v3 Main orchestrator — Hybrid vision + text system.
-
 Scan window: 12:00–20:00 SLST (Mon–Thu), every 15 min.
 Trade monitor: 24/7, every 5s.
 """
@@ -11,15 +10,13 @@ from datetime import datetime, timedelta, timezone
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
-    TOP_COINS_LIMIT, CHART_COIN_LIMIT,
+    TOP_COINS_LIMIT, CHART_COIN_LIMIT, CHART_TIMEOUT_SEC,
     REASONING_EFFORT, DEEPSEEK_MODEL,
     SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
-from chart_generator import (
-    generate_all_charts, chart_manager,
-)
+from chart_generator import generate_all_charts, chart_manager
 from payload_builder import build_payload
 from agent import run_agent
 from trade_monitor import monitor_loop, add_trade
@@ -80,66 +77,81 @@ def _fmt_sleep(s: float) -> str:
 
 async def signal_cycle():
     logger.info("═══ Signal cycle starting ═══")
+    cycle_dir = None
 
-    # 1. Fetch symbols
-    symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
-    if not symbols:
-        logger.warning("No symbols — skipping cycle")
-        return
+    try:
+        # 1. Fetch symbols
+        symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
+        if not symbols:
+            logger.warning("No symbols — skipping cycle")
+            return
 
-    # 2. Fetch OHLCV
-    logger.info("Fetching OHLCV for %d symbols …", len(symbols))
-    bundle = await fetch_all_data(symbols)
+        # 2. Fetch OHLCV
+        logger.info("Fetching OHLCV for %d symbols …", len(symbols))
+        bundle = await fetch_all_data(symbols)
 
-    # 3. Compute indicators
-    logger.info("Computing indicators …")
-    all_data = []
-    for sym, tf_data in bundle.items():
+        # 3. Compute indicators
+        logger.info("Computing indicators …")
+        all_data = []
+        for sym, tf_data in bundle.items():
+            try:
+                all_data.append(compute_multi_timeframe(sym, tf_data))
+            except Exception as exc:
+                logger.warning("Indicator error %s: %s", sym, exc)
+
+        if not all_data:
+            logger.warning("No data — skipping cycle")
+            return
+
+        # 4. Build text payload
+        payload = build_payload(all_data)
+        logger.info("Payload size: %.1f KB", len(payload) / 1024)
+
+        # 5. Generate charts (with timeout)
+        cycle_dir = chart_manager.new_cycle_dir()
+        chart_symbols = symbols[:CHART_COIN_LIMIT]
         try:
-            all_data.append(compute_multi_timeframe(sym, tf_data))
-        except Exception as exc:
-            logger.warning("Indicator error %s: %s", sym, exc)
-
-    if not all_data:
-        logger.warning("No data — skipping cycle")
-        return
-
-    # 4. Build text payload
-    payload = build_payload(all_data)
-    logger.info("Payload size: %.1f KB", len(payload) / 1024)
-
-    # 5. Generate charts for top N coins
-    cycle_dir = chart_manager.new_cycle_dir()
-    chart_symbols = symbols[:CHART_COIN_LIMIT]
-    chart_map = await generate_all_charts(bundle, chart_symbols, cycle_dir)
-
-    # 6. Send to DeepSeek
-    logger.info("Sending to DeepSeek (model=%s, effort=%s) …",
-                DEEPSEEK_MODEL, REASONING_EFFORT)
-    signal = await run_agent(payload, chart_map)
-
-    # 7. Cleanup charts
-    chart_manager.cleanup(cycle_dir)
-
-    # 8. Update state
-    update_state(
-        last_scan_at=datetime.now(SLST_TZ),
-        scan_count=AGENT_STATE["scan_count"] + 1,
-    )
-
-    # 9. Handle signal
-    if signal:
-        added = await add_trade(signal)
-        if added:
-            update_state(
-                last_signal=signal,
-                signal_count=AGENT_STATE["signal_count"] + 1,
+            chart_map = await asyncio.wait_for(
+                generate_all_charts(bundle, chart_symbols, cycle_dir),
+                timeout=CHART_TIMEOUT_SEC,
             )
-            logger.info("Signal registered: %s", signal["symbol"])
+        except asyncio.TimeoutError:
+            logger.error("Chart generation timed out after %ds — "
+                         "proceeding with text-only", CHART_TIMEOUT_SEC)
+            chart_map = {}
+
+        # 6. Send to DeepSeek
+        logger.info("Sending to DeepSeek (model=%s, effort=%s) …",
+                    DEEPSEEK_MODEL, REASONING_EFFORT)
+        signal = await run_agent(payload, chart_map)
+
+        # 7. Update state
+        update_state(
+            last_scan_at=datetime.now(SLST_TZ),
+            scan_count=AGENT_STATE["scan_count"] + 1,
+        )
+
+        # 8. Handle signal
+        if signal:
+            added = await add_trade(signal)
+            if added:
+                update_state(
+                    last_signal=signal,
+                    signal_count=AGENT_STATE["signal_count"] + 1,
+                )
+                logger.info("Signal registered: %s", signal["symbol"])
+            else:
+                logger.info("Signal skipped — max positions")
         else:
-            logger.info("Signal skipped — max positions")
-    else:
-        logger.info("No valid setup this cycle")
+            logger.info("No valid setup this cycle")
+
+    except Exception as exc:
+        logger.error("Signal cycle failed: %s", exc, exc_info=True)
+
+    finally:
+        # ALWAYS clean up charts, even if agent crashed
+        if cycle_dir:
+            chart_manager.cleanup(cycle_dir)
 
 
 async def signal_loop():
@@ -188,7 +200,6 @@ async def main():
     update_state(started_at=datetime.now(SLST_TZ))
     AGENT_STATE["scan_trigger"] = asyncio.Event()
 
-    # Cleanup old charts from previous runs
     chart_manager.startup_cleanup()
 
     logger.info("╔══════════════════════════════════════════╗")
