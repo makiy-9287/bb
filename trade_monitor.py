@@ -1,11 +1,9 @@
 """
 Continuous trade monitor with TP1/TP2 partial tracking.
-
-Lifecycle:
-  • TP1 hit → notify, move SL to breakeven (trade stays open)
-  • TP2 hit → notify, move SL to TP1     (trade stays open)
-  • TP3 hit → close (final PnL)
-  • SL hit  → close (with context: raw / breakeven / trailing)
+  • TP1 hit → move SL to breakeven, keep tracking
+  • TP2 hit → move SL to TP1, keep tracking
+  • TP3 hit → close with final PnL
+  • SL hit  → close with context
 """
 import asyncio
 import json
@@ -18,7 +16,7 @@ import aiohttp
 
 from config import (
     BINANCE_FUTURES_REST, MONITOR_INTERVAL_SEC,
-    ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE,
+    ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE, MAX_ACTIVE_TRADES,
 )
 from telegram_sender import send_raw_message
 
@@ -33,7 +31,6 @@ def _get_lock() -> asyncio.Lock:
     return _lock
 
 
-# ── File I/O ─────────────────────────────────────────────────────
 def _load_json(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
@@ -94,10 +91,17 @@ def _append_closed(trade: Dict[str, Any]):
     _save_json(CLOSED_TRADES_FILE, closed)
 
 
-# ── Trade lifecycle ──────────────────────────────────────────────
-async def add_trade(signal: Dict[str, Any]):
+async def add_trade(signal: Dict[str, Any]) -> bool:
+    """Register a new trade if under max concurrent limit."""
     async with _get_lock():
         trades = _load_json(ACTIVE_TRADES_FILE)
+        open_trades = [t for t in trades if t.get("status") == "open"]
+
+        if len(open_trades) >= MAX_ACTIVE_TRADES:
+            logger.warning("Max concurrent positions (%d) — skip %s",
+                           MAX_ACTIVE_TRADES, signal["symbol"])
+            return False
+
         t = dict(signal)
         t["opened_at"] = datetime.utcnow().isoformat()
         t["status"]    = "open"
@@ -107,14 +111,10 @@ async def add_trade(signal: Dict[str, Any]):
         trades.append(t)
         _save_json(ACTIVE_TRADES_FILE, trades)
     logger.info("Trade added: %s", signal["symbol"])
+    return True
 
 
-# ── Exit detection ───────────────────────────────────────────────
 def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
-    """
-    Return SL / TP1 / TP2 / TP3 or None.
-    Order matters: SL is checked first (protective), then TP3, TP2, TP1.
-    """
     d = trade["direction"].upper()
     sl  = float(trade["sl"])
     tp1 = float(trade["tp1"])
@@ -132,7 +132,7 @@ def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
             return "TP2"
         if not tp1_hit and price >= tp1:
             return "TP1"
-    else:  # SHORT
+    else:
         if price >= sl:
             return "SL"
         if not tp2_hit and price <= tp3:
@@ -144,11 +144,7 @@ def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
     return None
 
 
-def _cascade_tp_flags(t: Dict[str, Any], action: str) -> None:
-    """
-    BUG FIX: If price gaps past multiple TP levels in one cycle,
-    mark the intermediate TPs as hit so the record is consistent.
-    """
+def _cascade_tp_flags(t: Dict[str, Any], action: str):
     if action == "TP2":
         t["tp1_hit"] = True
         t["tp2_hit"] = True
@@ -159,7 +155,6 @@ def _cascade_tp_flags(t: Dict[str, Any], action: str) -> None:
 
 
 def _sl_context(t: Dict[str, Any]) -> str:
-    """Human-readable suffix describing how SL was positioned."""
     if t.get("tp2_hit"):
         return " (trailed to TP1)"
     if t.get("tp1_hit"):
@@ -167,7 +162,6 @@ def _sl_context(t: Dict[str, Any]) -> str:
     return ""
 
 
-# ── Main loop ────────────────────────────────────────────────────
 async def monitor_loop():
     logger.info("Trade monitor started (interval=%ds)", MONITOR_INTERVAL_SEC)
 
@@ -211,17 +205,17 @@ async def monitor_loop():
 
                     if action == "TP1":
                         t["tp1_hit"] = True
-                        t["sl"] = t["entry"]          # move to breakeven
+                        t["sl"] = t["entry"]
                         updated.append(t)
                         notifications.append((t, "TP1", price))
 
                     elif action == "TP2":
                         _cascade_tp_flags(t, "TP2")
-                        t["sl"] = t["tp1"]            # trail to TP1
+                        t["sl"] = t["tp1"]
                         updated.append(t)
                         notifications.append((t, "TP2", price))
 
-                    else:  # SL or TP3 → close
+                    else:
                         if action == "TP3":
                             _cascade_tp_flags(t, "TP3")
                         t["status"]      = "closed"
@@ -235,7 +229,6 @@ async def monitor_loop():
 
                 _save_json(ACTIVE_TRADES_FILE, updated)
 
-            # ── Send notifications outside lock ─────────────────
             for t, action, price in notifications:
                 sym = t["symbol"]
                 d = t["direction"].upper()
@@ -251,7 +244,7 @@ async def monitor_loop():
                     )
                     logger.info("%s hit %s @ %s", sym, action, price)
 
-                else:  # SL or TP3
+                else:
                     if action == "SL":
                         emoji = "❌"
                         reason_str = f"SL{_sl_context(t)}"
