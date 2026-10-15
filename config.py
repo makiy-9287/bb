@@ -1,5 +1,5 @@
 """
-v3 Configuration — Hybrid vision + text system.
+v4 Configuration — Pure raw-candles mode.
 Trading window: 12:00–20:00 SLST (Mon–Thu).
 """
 import os
@@ -30,40 +30,24 @@ TELEGRAM_BROADCAST_IDS = _ids
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
 TOP_COINS_LIMIT      = 40
-CANDLE_LIMIT         = 300
-OHLCV_FETCH_LIMIT    = 499
 
-# ── Timeframes ───────────────────────────────────────────────────
-TIMEFRAMES = ["4h", "1h", "15m"]
+# ── Candle counts per timeframe (v4) ─────────────────────────────
+CANDLES_4H    = 100
+CANDLES_1H    = 150
+CANDLES_15M   = 150
+MAX_CANDLES   = 499            # fetch buffer (more than we send)
+
+TIMEFRAMES    = ["4h", "1h", "15m"]
+
+CANDLE_COUNTS = {
+    "4h":  CANDLES_4H,
+    "1h":  CANDLES_1H,
+    "15m": CANDLES_15M,
+}
 
 # ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
-
-# ── Batching ─────────────────────────────────────────────────────
-# Send coins to DeepSeek in chunks to stay under API payload limits.
-# 20 coins × 3 TFs = 60 charts ≈ ~15-18 MB base64 per request.
-BATCH_SIZE = 20
-
-# ── Chart Generation ─────────────────────────────────────────────
-CHART_COIN_LIMIT   = 40
-CHART_WORKERS      = 3
-CHART_WIDTH_PX     = 1920
-CHART_HEIGHT_PX    = 1080
-CHART_DPI          = 100
-CHART_CLEANUP      = True
-CHART_RAW_CANDLES  = 20            # now actually used in indicators.py
-CHART_TIMEOUT_SEC  = 240           # hard cap for chart generation phase
-CHART_MAX_FILE_KB  = 450           # reject individual charts larger than this
-CHART_MAX_TOTAL_MB = 25            # log warning if total base64 exceeds this
-
-# ── SMC / Liquidity Tuning ───────────────────────────────────────
-SWING_LENGTH          = 20
-LIQUIDITY_RANGE_PCT   = 0.01
-POC_BINS              = 50
-SWEEP_LOOKBACK        = 30
-SWEEP_PEN_ATR_MIN     = 0.15
-EQUAL_LEVEL_TOL       = 0.001
-DISPLACEMENT_ATR_MULT = 1.5
+BATCH_SIZE        = 20
 
 # ── Trade Management ─────────────────────────────────────────────
 MAX_ACTIVE_TRADES    = 3
@@ -82,6 +66,5 @@ OFF_WEEKDAYS     = {4, 5, 6}
 DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Paths ────────────────────────────────────────────────────────
-DATA_DIR   = "data"
-CHARTS_DIR = os.path.join(DATA_DIR, "charts")
-os.makedirs(CHARTS_DIR, exist_ok=True)
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
