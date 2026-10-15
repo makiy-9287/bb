@@ -1,9 +1,5 @@
 """
 Continuous trade monitor with TP1/TP2 partial tracking.
-  • TP1 hit → move SL to breakeven, keep tracking
-  • TP2 hit → move SL to TP1, keep tracking
-  • TP3 hit → close with final PnL
-  • SL hit  → close with context
 """
 import asyncio
 import json
@@ -81,10 +77,6 @@ async def get_prices(symbols: List[str]) -> Dict[str, float]:
     return {s: pm[s] for s in symbols if s in pm}
 
 
-def _trade_key(t: Dict[str, Any]) -> str:
-    return f"{t.get('symbol','?')}|{t.get('opened_at','')}"
-
-
 def _append_closed(trade: Dict[str, Any]):
     closed = _load_json(CLOSED_TRADES_FILE)
     closed.append(trade)
@@ -92,7 +84,6 @@ def _append_closed(trade: Dict[str, Any]):
 
 
 async def add_trade(signal: Dict[str, Any]) -> bool:
-    """Register a new trade if under max concurrent limit."""
     async with _get_lock():
         trades = _load_json(ACTIVE_TRADES_FILE)
         open_trades = [t for t in trades if t.get("status") == "open"]
@@ -208,13 +199,11 @@ async def monitor_loop():
                         t["sl"] = t["entry"]
                         updated.append(t)
                         notifications.append((t, "TP1", price))
-
                     elif action == "TP2":
                         _cascade_tp_flags(t, "TP2")
                         t["sl"] = t["tp1"]
                         updated.append(t)
                         notifications.append((t, "TP2", price))
-
                     else:
                         if action == "TP3":
                             _cascade_tp_flags(t, "TP3")
@@ -243,7 +232,6 @@ async def monitor_loop():
                         f"_{extra}_ — still tracking TP3"
                     )
                     logger.info("%s hit %s @ %s", sym, action, price)
-
                 else:
                     if action == "SL":
                         emoji = "❌"
