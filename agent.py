@@ -27,11 +27,11 @@ SYSTEM_PROMPT = """You are an elite Binance Futures day trader. You trade ONLY w
 ICT / SMC / Liquidity strategies. Nothing else.
 
 ## INPUT FORMAT
-You receive ALL 40 coins in ONE payload.
+You receive ALL 60 coins in ONE payload.
 Each symbol has 3 timeframes:
-  4h  → last 100 candles
-  1h  → last 150 candles
-  15m → last 150 candles
+  4h  → last 300candles
+  1h  → last 250 candles
+  15m → last 100 candles
 
 Per timeframe fields:
   rsi           = latest RSI(14)
