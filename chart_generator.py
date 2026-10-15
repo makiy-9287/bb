@@ -1,8 +1,13 @@
 """
 Chart generator — 1920×1080 PNG with MA(7,25,99) + RSI + Volume.
 
-Uses SERIAL execution in a background thread (NOT ProcessPoolExecutor)
-to avoid fork-safety issues with matplotlib + pandas_ta_classic.
+Uses SERIAL execution in a background thread (asyncio.to_thread) to
+avoid fork-safety issues with matplotlib + pandas_ta_classic, and to
+keep timing predictable (~1.5s per chart).
+
+mplfinance savefig() note: only `fname`, `bbox_inches`, `pad_inches`,
+`format`, `transparent`, `facecolor`, `edgecolor` are supported keys.
+Do NOT pass `dpi` or `optimize` inside savefig dict.
 """
 import asyncio
 import logging
@@ -104,6 +109,7 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
             },
         )
 
+        # ── mpf.plot — note: dpi is a TOP-LEVEL param, NOT in savefig ──
         mpf.plot(
             df,
             type="candle",
@@ -116,9 +122,11 @@ def _generate_single_chart(args: Tuple) -> Optional[str]:
             dpi=CHART_DPI,
             title=f"{symbol}  |  {timeframe.upper()}",
             tight_layout=True,
-            savefig=dict(fname=output_path, dpi=CHART_DPI,
-                         bbox_inches="tight", pad_inches=0.1,
-                         optimize=True),
+            savefig=dict(
+                fname=output_path,
+                bbox_inches="tight",
+                pad_inches=0.1,
+            ),
         )
         plt.close("all")
 
