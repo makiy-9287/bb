@@ -29,13 +29,13 @@ TELEGRAM_BROADCAST_IDS = _ids
 
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 40
+TOP_COINS_LIMIT      = 60
 
 # ── Candle counts per timeframe ──────────────────────────────────
-CANDLES_4H    = 100
-CANDLES_1H    = 150
-CANDLES_15M   = 150
-MAX_CANDLES   = 499
+CANDLES_4H    = 300
+CANDLES_1H    = 250
+CANDLES_15M   = 100
+MAX_CANDLES   = 699
 
 TIMEFRAMES = ["4h", "1h", "15m"]
 
@@ -50,7 +50,7 @@ SCAN_INTERVAL_MIN = 15
 # NOTE: No batching in v4.1 — all coins sent in ONE request.
 
 # ── Trade Management ─────────────────────────────────────────────
-MAX_ACTIVE_TRADES    = 3
+MAX_ACTIVE_TRADES    = 10
 MONITOR_INTERVAL_SEC = 5
 ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
