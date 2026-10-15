@@ -1,5 +1,5 @@
 """
-v4 Configuration — Pure raw-candles mode.
+v4.1 Configuration — Single-request mode (no batching).
 Trading window: 12:00–20:00 SLST (Mon–Thu).
 """
 import os
@@ -31,13 +31,13 @@ TELEGRAM_BROADCAST_IDS = _ids
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
 TOP_COINS_LIMIT      = 40
 
-# ── Candle counts per timeframe (v4) ─────────────────────────────
+# ── Candle counts per timeframe ──────────────────────────────────
 CANDLES_4H    = 100
 CANDLES_1H    = 150
 CANDLES_15M   = 150
-MAX_CANDLES   = 499            # fetch buffer (more than we send)
+MAX_CANDLES   = 499
 
-TIMEFRAMES    = ["4h", "1h", "15m"]
+TIMEFRAMES = ["4h", "1h", "15m"]
 
 CANDLE_COUNTS = {
     "4h":  CANDLES_4H,
@@ -47,7 +47,7 @@ CANDLE_COUNTS = {
 
 # ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
-BATCH_SIZE        = 20
+# NOTE: No batching in v4.1 — all coins sent in ONE request.
 
 # ── Trade Management ─────────────────────────────────────────────
 MAX_ACTIVE_TRADES    = 3
