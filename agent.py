@@ -1,60 +1,117 @@
 """
-DeepSeek Flash vision agent — hybrid text + charts.
-With payload size validation and async file encoding.
+v4 Agent — pure raw-candle analysis. No charts, no vision.
+Prompt tuned for reading OHLCV arrays directly.
 """
 import asyncio
-import base64
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
 
 from config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    REASONING_EFFORT, USE_THINKING, CHART_MAX_TOTAL_MB,
+    REASONING_EFFORT, USE_THINKING, CANDLE_COUNTS,
 )
 from telegram_sender import send_signal
 
 logger = logging.getLogger(__name__)
+
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 _API_RETRIES = 3
 
 
-SYSTEM_PROMPT = """You are an ICT/SMC liquidity trader for Binance Futures day trading.
+SYSTEM_PROMPT = """You are an elite Binance Futures day trader. You trade ONLY with
+ICT / SMC / Liquidity strategies. Nothing else.
 
-## STRATEGY (only these)
-- Order Blocks (OB), Fair Value Gaps (FVG), Breaker Blocks (BB)
-- Break of Structure (BOS), Change of Character (CHoCH)
-- Liquidity sweeps, Equal Highs/Lows, Session extremes
-- Premium/Discount zones, OTE (0.618–0.79)
+## INPUT FORMAT
+Each symbol has 3 timeframes:
+  4h  → last 100 candles
+  1h  → last 150 candles
+  15m → last 150 candles
 
-## ENTRY — ALL 5 must align
-1. BOS/CHoCH aligned on 2+ timeframes
-2. Price in discount (LONG) or premium (SHORT)
-3. OB or FVG or BB confluence nearby
-4. Recent liquidity sweep (swB or swS with bar ≤ 8)
+Per timeframe fields:
+  rsi          = latest RSI(14)
+  ma7,ma25,ma99 = latest simple MAs
+  atr          = latest ATR(14)
+  last_close   = most recent close price
+  candles      = array of [open, high, low, close, volume]
+                 oldest first → newest last
+
+The LAST candle in each array is the most recent CLOSED candle.
+
+## HOW TO READ THE CANDLES
+- HIGH/LOW define structure. CLOSE defines direction.
+- Bodies vs wicks tell you intent. Big wick + small body = rejection.
+- Volume spikes = institutional activity.
+
+## HOW TO DETECT EACH CONCEPT FROM RAW CANDLES
+
+### Swing Highs / Lows
+A swing high = candle whose HIGH is higher than the 2 candles before
+and 2 candles after it. Swing low = mirror.
+
+### BOS (Break of Structure)
+Bullish BOS = a candle CLOSES above the most recent swing high.
+Bearish BOS = a candle CLOSES below the most recent swing low.
+
+### CHoCH (Change of Character)
+Bullish CHoCH = after a series of lower lows, price CLOSES above the
+last swing high (first sign of reversal up).
+Bearish CHoCH = after higher highs, price CLOSES below last swing low.
+
+### Order Block (OB)
+Bullish OB = the last BEARISH candle before a strong bullish move that
+breaks structure. Mark its HIGH and LOW.
+Bearish OB = the last BULLISH candle before a strong bearish move that
+breaks structure.
+
+### Fair Value Gap (FVG)
+Bullish FVG = 3-candle pattern where candle[i-1].high < candle[i+1].low.
+The gap = [candle[i-1].high, candle[i+1].low]. Price often returns to fill.
+Bearish FVG = candle[i-1].low > candle[i+1].high.
+
+### Breaker Block (BB)
+A former OB that price has broken THROUGH in the opposite direction.
+It now acts as support/resistance on retest.
+
+### Liquidity Sweep
+A candle WICKS beyond a prior swing high or low but CLOSES back inside.
+- Bullish sweep: wicks BELOW a swing low, closes ABOVE that low
+- Bearish sweep: wicks ABOVE a swing high, closes BELOW that high
+The swept level is your key reference.
+
+### Premium / Discount
+Take the range of the last ~50 candles (highest high - lowest low).
+  Above 50% midpoint = PREMIUM (look for SHORT)
+  Below 50% midpoint = DISCOUNT (look for LONG)
+Optimal Trade Entry (OTE) = 0.618 to 0.79 retracement of the range.
+
+## ENTRY — ALL 5 MUST ALIGN (else NO_SETUP)
+1. BOS or CHoCH aligned across 2+ timeframes
+2. Price in DISCOUNT (LONG) or PREMIUM (SHORT)
+3. OB, FVG, or Breaker Block confluence nearby
+4. Recent liquidity sweep (within last ~8 candles of that TF)
 5. RSI supportive (not overbought for LONG / oversold for SHORT)
 
-## SL / TP — use EXACT prices
-- `raw` field in each TF section = last 20 candles [ts,o,h,l,c,v]
-- Use these raw candles for precise SL/TP prices
-- SL: just beyond the nearest liquidity pool (swept low/high, OB edge,
-  swing point, bb edge) that invalidates the setup
-- TP1: nearest opposing liquidity level
-- TP2: next S/R cluster or 2R
-- TP3: 3R or opposite-side liquidity
+## SL / TP — USE EXACT PRICES FROM RAW CANDLES
+- SL: 3–5 ticks beyond the sweep low/high OR the OB edge OR the swing
+  point that would invalidate the setup. Use raw high/low values.
+- TP1: nearest opposing liquidity level (a recent swing high for LONG,
+  a recent swing low for SHORT) OR 1R, whichever is FARTHER.
+- TP2: next swing extreme OR 2R.
+- TP3: next major liquidity OR 3R.
 
 ## RULES
-- Both LONG and SHORT allowed
-- Charts (4H, 1H, 15m) show visual context — study sweeps, wicks,
-  displacement, and structure at the right edge
-- If no valid setup: reply exactly NO_SETUP. Do not force trades.
+- Both LONG and SHORT allowed. Pick whichever has confluence.
+- Emit AT MOST ONE signal per batch.
+- If no valid setup exists: reply exactly NO_SETUP. Do not force trades.
+- Never invent candles that are not in the data.
 
 ## OUTPUT
-Use send_trade_signal tool. `reason` = concise confluence summary (max 120 chars)."""
+Use the send_trade_signal tool. `reason` = concise ICT summary (max 120 chars)."""
 
 
 TOOLS = [{
@@ -99,19 +156,6 @@ def _build_request_kwargs() -> dict:
     return kwargs
 
 
-def _encode_chart_sync(path: str) -> Optional[str]:
-    """Sync base64 encoder — called via asyncio.to_thread."""
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        return f"data:image/png;base64,{b64}"
-    except Exception as exc:
-        logger.warning("Chart encode failed %s: %s", path, exc)
-        return None
-
-
 def _save_reasoning(reasoning: str):
     try:
         os.makedirs("debug_reasoning", exist_ok=True)
@@ -122,64 +166,14 @@ def _save_reasoning(reasoning: str):
         logger.warning("Could not save reasoning: %s", e)
 
 
-async def _encode_all_charts(
-    chart_map: Optional[Dict[str, List[str]]],
-) -> List[str]:
-    """Encode all charts concurrently, with size logging."""
-    if not chart_map:
-        return []
-
-    tasks = []
-    for symbol, paths in chart_map.items():
-        for path in paths:
-            tasks.append(asyncio.to_thread(_encode_chart_sync, path))
-
-    if not tasks:
-        return []
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    urls = [r for r in results if isinstance(r, str)]
-
-    total_bytes = sum(len(u) for u in urls)
-    total_mb = total_bytes / (1024 * 1024)
-    logger.info("Encoded %d charts, total %.1f MB base64",
-                len(urls), total_mb)
-
-    if total_mb > CHART_MAX_TOTAL_MB:
-        logger.warning("Payload %.1f MB exceeds safe limit (%d MB) — "
-                       "consider reducing CHART_COIN_LIMIT",
-                       total_mb, CHART_MAX_TOTAL_MB)
-    return urls
-
-
-async def run_agent(
-    payload_json: str,
-    chart_map: Optional[Dict[str, List[str]]] = None,
-) -> Optional[Dict[str, Any]]:
+async def run_agent(payload_json: str) -> Optional[Dict[str, Any]]:
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY missing")
         return None
 
-    # Encode charts asynchronously
-    chart_urls = await _encode_all_charts(chart_map)
-
-    content: List[Dict[str, Any]] = [
-        {"type": "text", "text": f"Market data:\n{payload_json}"},
-    ]
-    for url in chart_urls:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": url},
-        })
-
-    if not chart_urls:
-        logger.warning("No charts encoded — sending text-only payload")
-    else:
-        logger.info("Sending %d charts + text to DeepSeek …", len(chart_urls))
-
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": content},
+        {"role": "user", "content": f"Market data:\n{payload_json}"},
     ]
 
     response = None
@@ -195,7 +189,7 @@ async def run_agent(
                              _API_RETRIES, exc)
                 return None
             wait = 2 ** attempt
-            logger.warning("DeepSeek err (attempt %d/%d): %s — retry %ds",
+            logger.warning("DeepSeek err (%d/%d): %s — retry %ds",
                            attempt + 1, _API_RETRIES, exc, wait)
             await asyncio.sleep(wait)
 
@@ -206,11 +200,10 @@ async def run_agent(
     msg = response.choices[0].message
     reasoning = getattr(msg, "reasoning_content", None)
     if reasoning:
-        preview = reasoning[:500].replace("\n", " ")
-        logger.info("🧠 Reasoning (%d chars): %s …", len(reasoning), preview)
+        logger.info("🧠 Reasoning (%d chars): %s …",
+                    len(reasoning), reasoning[:500].replace("\n", " "))
         _save_reasoning(reasoning)
 
-        # ── Log token usage ─────────────────────────────────────────
     try:
         usage = response.usage
         if usage:
@@ -222,12 +215,11 @@ async def run_agent(
         pass
 
     if not msg.tool_calls:
-        content_str = (msg.content or "").strip()
-        if content_str:
-            logger.info("Agent reply: %s", content_str[:200])
+        content = (msg.content or "").strip()
+        if content:
+            logger.info("Agent reply: %s", content[:200])
         else:
-            logger.info("Agent NO_SETUP (reasoning=%d chars)",
-                        len(reasoning) if reasoning else 0)
+            logger.info("Agent NO_SETUP")
         return None
 
     args_str = msg.tool_calls[0].function.arguments or ""
