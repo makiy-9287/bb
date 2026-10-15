@@ -1,6 +1,6 @@
 """
 DeepSeek Flash vision agent — hybrid text + charts.
-Model: deepseek-flash (native vision, 384 tokens/image, max 600 images).
+With payload size validation and async file encoding.
 """
 import asyncio
 import base64
@@ -14,19 +14,18 @@ from openai import AsyncOpenAI
 
 from config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    REASONING_EFFORT, USE_THINKING,
+    REASONING_EFFORT, USE_THINKING, CHART_MAX_TOTAL_MB,
 )
 from telegram_sender import send_signal
 
 logger = logging.getLogger(__name__)
-
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 _API_RETRIES = 3
 
 
 SYSTEM_PROMPT = """You are an ICT/SMC liquidity trader for Binance Futures day trading.
 
-## STRATEGY (only these — ignore everything else)
+## STRATEGY (only these)
 - Order Blocks (OB), Fair Value Gaps (FVG), Breaker Blocks (BB)
 - Break of Structure (BOS), Change of Character (CHoCH)
 - Liquidity sweeps, Equal Highs/Lows, Session extremes
@@ -39,24 +38,23 @@ SYSTEM_PROMPT = """You are an ICT/SMC liquidity trader for Binance Futures day t
 4. Recent liquidity sweep (swB or swS with bar ≤ 8)
 5. RSI supportive (not overbought for LONG / oversold for SHORT)
 
-## SL / TP — use EXACT prices from the raw candles
-- SL: just beyond the nearest liquidity pool that invalidates the setup
-  (swept low/high, OB edge, swing point, bb edge)
+## SL / TP — use EXACT prices
+- `raw` field in each TF section = last 20 candles [ts,o,h,l,c,v]
+- Use these raw candles for precise SL/TP prices
+- SL: just beyond the nearest liquidity pool (swept low/high, OB edge,
+  swing point, bb edge) that invalidates the setup
 - TP1: nearest opposing liquidity level
 - TP2: next S/R cluster or 2R
 - TP3: 3R or opposite-side liquidity
 
 ## RULES
-- Both LONG and SHORT allowed — pick whichever has the confluence
-- Charts (4H, 1H, 15m) give you the visual context: study sweeps, wicks,
-  displacement, and structure at the right edge of each chart
-- The `raw` field in the payload gives 20 exact candles per TF — use
-  these for precise SL/TP prices
-- If no valid setup exists: reply exactly NO_SETUP. Do not force trades.
+- Both LONG and SHORT allowed
+- Charts (4H, 1H, 15m) show visual context — study sweeps, wicks,
+  displacement, and structure at the right edge
+- If no valid setup: reply exactly NO_SETUP. Do not force trades.
 
 ## OUTPUT
-Use the send_trade_signal tool. The `reason` field must be a concise
-confluence summary (max 120 chars)."""
+Use send_trade_signal tool. `reason` = concise confluence summary (max 120 chars)."""
 
 
 TOOLS = [{
@@ -74,7 +72,8 @@ TOOLS = [{
                 "tp1":        {"type": "number"},
                 "tp2":        {"type": "number"},
                 "tp3":        {"type": "number"},
-                "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                "confidence": {"type": "string",
+                               "enum": ["low", "medium", "high"]},
                 "reason":     {"type": "string"},
             },
             "required": ["symbol", "direction", "entry", "sl",
@@ -100,8 +99,8 @@ def _build_request_kwargs() -> dict:
     return kwargs
 
 
-def _encode_chart(path: str) -> Optional[str]:
-    """Base64-encode a PNG chart as a data URL."""
+def _encode_chart_sync(path: str) -> Optional[str]:
+    """Sync base64 encoder — called via asyncio.to_thread."""
     try:
         if not os.path.exists(path):
             return None
@@ -123,34 +122,60 @@ def _save_reasoning(reasoning: str):
         logger.warning("Could not save reasoning: %s", e)
 
 
+async def _encode_all_charts(
+    chart_map: Optional[Dict[str, List[str]]],
+) -> List[str]:
+    """Encode all charts concurrently, with size logging."""
+    if not chart_map:
+        return []
+
+    tasks = []
+    for symbol, paths in chart_map.items():
+        for path in paths:
+            tasks.append(asyncio.to_thread(_encode_chart_sync, path))
+
+    if not tasks:
+        return []
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    urls = [r for r in results if isinstance(r, str)]
+
+    total_bytes = sum(len(u) for u in urls)
+    total_mb = total_bytes / (1024 * 1024)
+    logger.info("Encoded %d charts, total %.1f MB base64",
+                len(urls), total_mb)
+
+    if total_mb > CHART_MAX_TOTAL_MB:
+        logger.warning("Payload %.1f MB exceeds safe limit (%d MB) — "
+                       "consider reducing CHART_COIN_LIMIT",
+                       total_mb, CHART_MAX_TOTAL_MB)
+    return urls
+
+
 async def run_agent(
     payload_json: str,
-    chart_map: Dict[str, List[str]],
+    chart_map: Optional[Dict[str, List[str]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Send payload + charts to DeepSeek. chart_map = {symbol: [paths]}.
-    """
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY missing")
         return None
 
-    # Build multimodal content blocks
+    # Encode charts asynchronously
+    chart_urls = await _encode_all_charts(chart_map)
+
     content: List[Dict[str, Any]] = [
         {"type": "text", "text": f"Market data:\n{payload_json}"},
     ]
+    for url in chart_urls:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
 
-    chart_count = 0
-    for symbol, paths in chart_map.items():
-        for path in paths:
-            url = _encode_chart(path)
-            if url:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": url},
-                })
-                chart_count += 1
-
-    logger.info("Sending %d charts + text to DeepSeek …", chart_count)
+    if not chart_urls:
+        logger.warning("No charts encoded — sending text-only payload")
+    else:
+        logger.info("Sending %d charts + text to DeepSeek …", len(chart_urls))
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
