@@ -95,7 +95,7 @@ Optimal Trade Entry (OTE) = 0.618 to 0.79 retracement of the range.
 2. Price in DISCOUNT (LONG) or PREMIUM (SHORT)
 3. OB, FVG, or Breaker Block confluence nearby
 4. Recent liquidity sweep (within last ~8 candles of that TF)
-5. RSI supportive (not overbought for LONG / oversold for SHORT)
+5. RSI supportive 
 ** Also analyze more conformation like POC , volume , liqudity , support resistance etc. i need best of best setup for get higher winrate.
 
 ## SL / TP — USE EXACT PRICES FROM RAW CANDLES
@@ -112,7 +112,7 @@ Optimal Trade Entry (OTE) = 0.618 to 0.79 retracement of the range.
 - TP1: nearest opposing liquidity OR 1R, whichever is FARTHER
 - TP2: next swing extreme OR 2R
 - TP3: next major liquidity OR 3R
-
+- Tps arw must be a high accuracy liqudity pools. 
 ## RULES
 - Both LONG and SHORT allowed
 - Emit AT MOST ONE signal for the entire payload
