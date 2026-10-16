@@ -61,8 +61,8 @@ SLST_END         = dt_time(20, 0)
 SLST_UTC_OFFSET  = 5.5
 
 # ── Trading Days ─────────────────────────────────────────────────
-TRADING_WEEKDAYS = {0, 1, 2, 3}
-OFF_WEEKDAYS     = {4, 5, 6}
+TRADING_WEEKDAYS = {0, 1, 2, 3, 4}
+OFF_WEEKDAYS     = {5, 6}
 DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Paths ────────────────────────────────────────────────────────
