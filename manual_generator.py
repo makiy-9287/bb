@@ -1,11 +1,13 @@
 """
-Weekend Manual Data Generator
-Fetches raw data for Top 100 coins and generates a compact JSON file.
+Weekend Manual Data Generator with Auto-Upload
+Fetches raw data for Top 100 coins, generates JSON, and uploads it.
+Returns a direct download link.
 """
 import asyncio
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime
 from typing import List
 
@@ -13,7 +15,7 @@ import aiohttp
 import ccxt.async_support as ccxt
 
 # ── CONFIGURATION ────────────────────────────────────────────────
-TOP_COINS_LIMIT = 70  # ඔයාට ඕන ගාන මෙතන දාන්න
+TOP_COINS_LIMIT = 100   # ඔයාට ඕන ගාන මෙතන දාන්න
 
 TF_LIMITS = {
     "4h": 400,
@@ -46,7 +48,6 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int):
             for c in raw
         ]
     except Exception as e:
-        logger.warning(f"Failed {symbol} {timeframe}: {e}")
         return []
 
 async def main():
@@ -72,7 +73,7 @@ async def main():
                 return sym, coin_data
             return sym, None
 
-    logger.info("Fetching OHLCV data (this will take a few minutes for 100 coins)...")
+    logger.info("Fetching OHLCV data (this will take a few minutes)...")
     tasks = [process_coin(s) for s in symbols]
     results = await asyncio.gather(*tasks)
     
@@ -96,9 +97,28 @@ async def main():
 
     size_mb = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
     logger.info(f"✅ Generated {OUTPUT_FILE} ({size_mb:.1f} MB) for {len(final_data['coins'])} coins.")
-    logger.info("👉 To download, run this command:")
-    logger.info("   python3 -m http.server 8000")
-    logger.info(f"   Then open in browser: http://<YOUR_VPS_IP>:8000/{OUTPUT_FILE}")
+    
+    # ── AUTO UPLOAD TO CLOUD ─────────────────────────────────────
+    logger.info("Uploading file to cloud to get a direct link...")
+    try:
+        # bashupload.com is a free, reliable file sharing service
+        result = subprocess.run(
+            ["curl", "bashupload.com", "-T", OUTPUT_FILE],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode == 0 and result.stdout:
+            link = result.stdout.strip()
+            logger.info("\n" + "="*60)
+            logger.info(f"🎉 DOWNLOAD LINK: {link}")
+            logger.info("="*60 + "\n")
+            logger.info("Copy this link and download the file. (Link expires in 3 days)")
+        else:
+            logger.error(f"Upload failed. Please try again. Error: {result.stderr}")
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
 
 if __name__ == "__main__":
     try:
