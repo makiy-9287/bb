@@ -15,12 +15,12 @@ import aiohttp
 import ccxt.async_support as ccxt
 
 # ── CONFIGURATION ────────────────────────────────────────────────
-TOP_COINS_LIMIT = 100   # ඔයාට ඕන ගාන මෙතන දාන්න
+TOP_COINS_LIMIT = 60   # ඔයාට ඕන ගාන මෙතන දාන්න
 
 TF_LIMITS = {
-    "4h": 400,
+    "4h": 300,
     "1h": 300,
-    "15m": 200,
+    "15m": 100,
     "5m": 50
 }
 OUTPUT_FILE = "manual_data_100.json"
