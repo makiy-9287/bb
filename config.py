@@ -29,13 +29,13 @@ TELEGRAM_BROADCAST_IDS = _ids
 
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 50
+TOP_COINS_LIMIT      = 40
 
 # ── Candle counts per timeframe ──────────────────────────────────
-CANDLES_4H    = 300
-CANDLES_1H    = 250
+CANDLES_4H    = 150
+CANDLES_1H    = 100
 CANDLES_15M   = 100
-MAX_CANDLES   = 699
+MAX_CANDLES   = 359
 
 TIMEFRAMES = ["4h", "1h", "15m"]
 
@@ -61,8 +61,8 @@ SLST_END         = dt_time(20, 0)
 SLST_UTC_OFFSET  = 5.5
 
 # ── Trading Days ─────────────────────────────────────────────────
-TRADING_WEEKDAYS = {0, 1, 2, 3, 4}
-OFF_WEEKDAYS     = {5, 6}
+TRADING_WEEKDAYS = {0, 1, 2, 3}
+OFF_WEEKDAYS     = {4, 5, 6}
 DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Paths ────────────────────────────────────────────────────────
