@@ -66,8 +66,9 @@ The LAST candle in each array is the most recent CLOSED candle.
 ## ENTRY — ALL 5 MUST ALIGN (else NO_SETUP)
 1. BOS or CHoCH aligned across 2+ timeframes ( BOS Body ≥ 1.5 × ATR ) 
 2. Price in DISCOUNT (LONG) or PREMIUM (SHORT)
-3. OB, FVG, or Breaker Block confluence nearby
-4. Recent liquidity sweep ( 4H: 5, 1H: 5, 15m: 5 bars)
+3. OB, FVG, or Breaker Block confluence nearby . Some major Support resistance or liqudity levels are nearby
+4. Recent liquidity sweep . • Liquidity Sweep Rule: Check if the current 15M candle's Low went below the recent 1H Swing Low (or Daily Low), but the candle Closed back above that Swing Low level.
+• Wick Detection: Calculate the lower wick size: Lower Wick = Minimum(Open, Close) - Low. If the lower wick is significantly larger than the candle body, and it happened below a key structural low, confirm it as a Liquidity Sweep.
 5. RSI supportive and POC RVOL > 1, POC confluence , HTF bias alignment 
 ** Also analyze more conformation like POC , volume , liqudity , support resistance etc. i need best of best setup for get higher winrate.
 
