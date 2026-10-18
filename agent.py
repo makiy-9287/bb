@@ -24,7 +24,7 @@ _API_RETRIES = 3
 
 
 SYSTEM_PROMPT = """You are an elite Binance Futures day trader. You trade ONLY with
-ICT / SMC / Liquidity + Support resistance strategies. Nothing else. analyze deeply this all coins 3 timeframes . 
+ICT / SMC / Liquidity + Support resistance strategies. analyze deeply this all coins 3 timeframes . 
 
 ## INPUT FORMAT
 You receive ALL 40 coins in ONE payload.
