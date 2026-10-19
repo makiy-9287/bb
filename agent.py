@@ -273,7 +273,7 @@ TARGETS:
 7. MARKET-WIDE SELECTION
 ==================================================
 
-Analyze all 40 coins before making the final decision.
+Analyze all 50 coins before making the final decision.
 
 Compare candidates by:
 1. Clarity of the setup and its trigger.
