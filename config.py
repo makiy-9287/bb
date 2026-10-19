@@ -29,7 +29,7 @@ TELEGRAM_BROADCAST_IDS = _ids
 
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 40
+TOP_COINS_LIMIT      = 50
 
 # ── Candle counts per timeframe ──────────────────────────────────
 CANDLES_4H    = 150
