@@ -63,7 +63,7 @@ The LAST candle in each array is the most recent CLOSED candle.
  *  Premium / Discount with fibonachi ( set golden level to entry zone calculations 
  * POC 
 
-## ENTRY — ALL 5 MUST ALIGN (else NO_SETUP)
+## ENTRY CONFORMATION ALIGN. Need for high probability setups. (else NO_SETUP)
 1. BOS or CHoCH aligned across 2+ timeframes ( BOS Body ≥ 1.5 × ATR ) 
 2. Price in DISCOUNT (LONG) or PREMIUM (SHORT)
 3. OB, FVG, or Breaker Block confluence nearby . Some major Support resistance or liqudity levels are nearby
