@@ -15,11 +15,11 @@ import aiohttp
 import ccxt.async_support as ccxt
 
 # ── CONFIGURATION ────────────────────────────────────────────────
-TOP_COINS_LIMIT = 60   # ඔයාට ඕන ගාන මෙතන දාන්න
+TOP_COINS_LIMIT = 80   # ඔයාට ඕන ගාන මෙතන දාන්න
 
 TF_LIMITS = {
-    "4h": 300,
-    "1h": 300,
+    "4h": 150,
+    "1h": 150,
     "15m": 100,
     "5m": 50
 }
