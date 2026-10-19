@@ -1,4 +1,4 @@
-
+"""
 v4.1 Agent — pure raw-candle analysis, single request.
 Prompt tuned for reading OHLCV arrays + SL minimums by coin tier.
 """
