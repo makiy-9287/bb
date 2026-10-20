@@ -201,9 +201,9 @@ Do not award points for unavailable or unconfirmed evidence.
 Interpretation:
 - 9-10: exceptional evidence, if risk is acceptable
 - 8: strong candidate
-- 8: potentially valid, but only if the setup model is clear
+- 7.5: potentially valid, but only if the setup model is clear
   and all risk checks pass
-- Below 8: reject
+- Below 7.5: reject
 
 A score is an evidence-ranking tool, NOT a statistically
 calibrated probability of winning.
