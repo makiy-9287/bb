@@ -51,7 +51,7 @@ SCAN_INTERVAL_MIN = 15
 
 # ── Trade Management ─────────────────────────────────────────────
 MAX_ACTIVE_TRADES    = 10
-BATCH_SIZE        = 10
+BATCH_SIZE        = 5
 MONITOR_INTERVAL_SEC = 5
 ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
