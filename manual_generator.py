@@ -15,13 +15,13 @@ import aiohttp
 import ccxt.async_support as ccxt
 
 # ── CONFIGURATION ────────────────────────────────────────────────
-TOP_COINS_LIMIT = 80   # ඔයාට ඕන ගාන මෙතන දාන්න
+TOP_COINS_LIMIT = 70   # ඔයාට ඕන ගාන මෙතන දාන්න
 
 TF_LIMITS = {
     "4h": 150,
-    "1h": 150,
+    "1h": 100,
     "15m": 100,
-    "5m": 50
+    "5m": 10
 }
 OUTPUT_FILE = "manual_data_100.json"
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
