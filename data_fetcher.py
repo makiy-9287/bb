@@ -1,5 +1,6 @@
 """
 Binance Futures data fetcher — concurrency-limited, retry-safe.
+With blacklist for non-crypto / bad instruments.
 """
 import asyncio
 import logging
@@ -21,7 +22,7 @@ _RETRIES     = 3
 
 
 async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
-    """Top USDT perpetuals by volume, filtered for real liquidity."""
+    """Top USDT perpetuals by volume, with blacklist filter."""
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/24hr"
     try:
         async with aiohttp.ClientSession() as session:
@@ -35,23 +36,25 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
         return []
 
     if not isinstance(data, list):
-        logger.error("Binance returned non-list: %s", str(data)[:200])
         return []
 
     MIN_VOLUME_USD  = 50_000_000
     MIN_TRADE_COUNT = 200_000
-    TOKENIZED = {
+    
+    # ── BLACKLIST (Non-crypto / Bad SMC instruments) ─────────────
+    BLACKLIST = {
+        "USDCUSDT",
+        # Commodities / Indices on Binance Futures
+        "BZUSDT",   # Brent Crude Oil
+        "CLUSDT",   # WTI Crude Oil
+        "NATGASUSDT", # Natural Gas
+        "XAUUSDT",  # Gold
+        "XAGUSDT",  # Silver
+        # Tokenized Stocks (Fake volume/no SMC structure)
         "AAPLUSDT", "MSFTUSDT", "GOOGLUSDT", "AMZNUSDT", "METAUSDT",
         "NVDAUSDT", "TSLAUSDT", "NFLXUSDT", "AMDUSDT", "COINUSDT",
         "MSTRUSDT", "SPCXUSDT", "PLTRUSDT", "CRCLUSDT", "HOODUSDT",
     }
-        BLACKLIST = {
-        "USDCUSDT",
-        "BZUSDT", "CLUSDT", "NATGASUSDT", "XAUUSDT", "XAGUSDT", # Oil, Gold, Silver
-        "AAPLUSDT", "MSFTUSDT", "GOOGLUSDT", "AMZNUSDT", "METAUSDT",
-        "NVDAUSDT", "TSLAUSDT", "NFLXUSDT", "AMDUSDT", "COINUSDT",
-        "MSTRUSDT", "SPCXUSDT", "PLTRUSDT", "CRCLUSDT", "HOODUSDT",
-}
 
     filtered = []
     for t in data:
@@ -60,7 +63,7 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
-        if sym in BLACKLIST or sym in TOKENIZED:
+        if sym in BLACKLIST:
             continue
         try:
             vol = float(t.get("quoteVolume", 0))
@@ -77,7 +80,7 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
 
     filtered.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     symbols = [t["symbol"] for t in filtered[:limit]]
-    logger.info("Top %d symbols — sample: %s", len(symbols), symbols[:5])
+    logger.info("Top %d symbols (blacklist applied) — sample: %s", len(symbols), symbols[:5])
     return symbols
 
 
@@ -105,7 +108,6 @@ async def fetch_ohlcv(
 async def fetch_all_data(
     symbols: List[str],
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
-    """Fetch OHLCV for every symbol × timeframe (max 10 concurrent)."""
     exchange = ccxt.binance({
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
@@ -123,7 +125,6 @@ async def fetch_all_data(
     bundle: Dict[str, Dict[str, pd.DataFrame]] = {}
     for r in results:
         if isinstance(r, Exception):
-            logger.warning("Fetch task failed: %s", r)
             continue
         sym, tf, df = r
         if df.empty:
