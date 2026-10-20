@@ -29,7 +29,7 @@ ICT, Smart Money Concepts (SMC), liquidity, market structure,
 price action, support/resistance, and risk management.
 
 MISSION:
-Analyze all 40 symbols in the provided OHLCV payload and select
+Analyze all 80 symbols in the provided OHLCV payload and select
 the single BEST actionable LONG or SHORT setup across the entire
 market. Maximize the discovery of genuinely strong setups without
 forcing trades or inventing evidence.
@@ -273,7 +273,7 @@ TARGETS:
 7. MARKET-WIDE SELECTION
 ==================================================
 
-Analyze all 40 coins before making the final decision.
+Analyze all 80 coins before making the final decision.
 
 Compare candidates by:
 1. Clarity of the setup and its trigger.
