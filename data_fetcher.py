@@ -45,7 +45,13 @@ async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
         "NVDAUSDT", "TSLAUSDT", "NFLXUSDT", "AMDUSDT", "COINUSDT",
         "MSTRUSDT", "SPCXUSDT", "PLTRUSDT", "CRCLUSDT", "HOODUSDT",
     }
-    BLACKLIST = {"USDCUSDT"}
+        BLACKLIST = {
+        "USDCUSDT",
+        "BZUSDT", "CLUSDT", "NATGASUSDT", "XAUUSDT", "XAGUSDT", # Oil, Gold, Silver
+        "AAPLUSDT", "MSFTUSDT", "GOOGLUSDT", "AMZNUSDT", "METAUSDT",
+        "NVDAUSDT", "TSLAUSDT", "NFLXUSDT", "AMDUSDT", "COINUSDT",
+        "MSTRUSDT", "SPCXUSDT", "PLTRUSDT", "CRCLUSDT", "HOODUSDT",
+}
 
     filtered = []
     for t in data:
