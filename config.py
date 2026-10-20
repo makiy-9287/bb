@@ -56,12 +56,12 @@ ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
 
 # ── Execution Window (Sri Lanka Time, UTC+5:30) ──────────────────
-SLST_START       = dt_time(12, 0)
+SLST_START       = dt_time(8, 0)
 SLST_END         = dt_time(20, 0)
 SLST_UTC_OFFSET  = 5.5
 
 # ── Trading Days ─────────────────────────────────────────────────
-TRADING_WEEKDAYS = {0, 1, 2, 3}
+TRADING_WEEKDAYS = {1, 2, 3}
 OFF_WEEKDAYS     = {4, 5, 6}
 DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
