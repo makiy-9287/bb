@@ -1,18 +1,16 @@
 """
-v5.1 Main orchestrator — Multi-Key, BTC Context Injection.
+v6 Main Orchestrator — Parallel Multi-Key Execution.
 """
 import asyncio
 import logging
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
     TOP_COINS_LIMIT, BATCH_SIZE, OPENROUTER_API_KEYS, OPENROUTER_MODEL,
-    SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
-    CANDLE_COUNTS, MONITOR_INTERVAL_SEC
+    SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES, MONITOR_INTERVAL_SEC
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
@@ -20,7 +18,6 @@ from payload_builder import build_payload
 from agent import run_agent
 from trade_monitor import monitor_loop, add_trade
 from telegram_bot import telegram_bot_supervisor, update_state, AGENT_STATE
-from key_manager import KeyManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,13 +25,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("agent.log")],
 )
 logging.getLogger("pandas_ta_classic").setLevel(logging.ERROR)
-logging.getLogger("pandas_ta_classic.utils.core").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
-
-key_manager = KeyManager(OPENROUTER_API_KEYS)
 
 def in_execution_window() -> bool:
     now = datetime.now(SLST_TZ)
@@ -63,17 +57,26 @@ def _seconds_to_next_scan_boundary() -> float:
         wait += SCAN_INTERVAL_MIN * 60
     return wait
 
-def _fmt_sleep(s: float) -> str:
-    if s >= 3600:
-        return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
-    return f"{int(s // 60)}m"
+async def process_single_batch(batch_data, api_key, batch_idx):
+    """Runs a single batch asynchronously."""
+    payload = build_payload(batch_data)
+    logger.info("▶️ Batch %d started (Key: ...%s)", batch_idx, api_key[-4:])
+    
+    t0 = time.time()
+    signal = await run_agent(payload, api_key)
+    elapsed = time.time() - t0
+    
+    if signal:
+        logger.info("✅ Batch %d found: %s %s in %.1fs", batch_idx, signal["direction"], signal["symbol"], elapsed)
+        return signal
+    else:
+        logger.info("✗ Batch %d returned NO_SETUP in %.1fs", batch_idx, elapsed)
+        return None
 
 
 async def signal_cycle():
     cycle_start = time.time()
-    current_api_key = key_manager.rotate()
-    
-    logger.info("═══ Signal cycle starting (Key: ...%s) ═══", current_api_key[-4:])
+    logger.info("═══ Signal cycle starting ═══")
 
     try:
         logger.info("Step 1/4 — Fetching top %d symbols …", TOP_COINS_LIMIT)
@@ -82,64 +85,48 @@ async def signal_cycle():
             return
 
         logger.info("Step 2/4 — Fetching OHLCV (1D/4H/1H/15M) …")
-        t = time.time()
         bundle = await fetch_all_data(symbols)
-        logger.info("Step 2/4 — Done: %d symbols in %.1fs", len(bundle), time.time() - t)
 
         logger.info("Step 3/4 — Computing indicators …")
-        t = time.time()
         all_data = []
         for sym, tf_data in bundle.items():
             try:
                 all_data.append(compute_multi_timeframe(sym, tf_data))
             except Exception as exc:
                 logger.warning("Indicator error %s: %s", sym, exc)
-        logger.info("Step 3/4 — Done: %d symbols in %.1fs", len(all_data), time.time() - t)
 
         if not all_data:
             return
 
-        # ── Extract BTC Data for Context ──
-        btc_data = next((d for d in all_data if d["symbol"] == "BTCUSDT"), None)
-        if btc_data:
-            logger.info("✅ BTCUSDT Context loaded for injection.")
-        else:
-            logger.warning("⚠️ BTCUSDT not found in top coins list! Context missing.")
-
-        # Split into batches (70 / 10 = 7 batches)
+        # ── Step 4: Batch & Parallel API Calls ──
         batches = [all_data[i:i + BATCH_SIZE] for i in range(0, len(all_data), BATCH_SIZE)]
-        logger.info("Step 4/4 — Split into %d batches of %d coins", len(batches), BATCH_SIZE)
+        logger.info("Step 4/4 — Launching %d batches IN PARALLEL", len(batches))
 
-        signals = []
-        for i, batch_data in enumerate(batches, 1):
-            # 🚨 Inject BTC into this batch if it's not already there
-            current_batch = list(batch_data)
-            if btc_data and not any(d["symbol"] == "BTCUSDT" for d in current_batch):
-                current_batch.insert(0, btc_data)
+        # Map each batch to a specific API Key
+        tasks = []
+        for i, batch in enumerate(batches):
+            # Use modulo in case batches > keys
+            key = OPENROUTER_API_KEYS[i % len(OPENROUTER_API_KEYS)]
+            tasks.append(process_single_batch(batch, key, i+1))
 
-            logger.info("▶️ Processing Batch %d/%d (%d coins incl BTC) (Key: ...%s) …", 
-                        i, len(batches), len(current_batch), current_api_key[-4:])
-            
-            payload = build_payload(current_batch)
-            signal = await run_agent(payload, current_api_key)
+        # 🚀 RUN ALL AT THE SAME TIME 🚀
+        results = await asyncio.gather(*tasks)
 
-            if signal:
-                logger.info("✅ Batch %d found: %s %s", i, signal["direction"], signal["symbol"])
-                signals.append(signal)
+        # Filter out None values
+        signals = [s for s in results if s]
 
         update_state(last_scan_at=datetime.now(SLST_TZ), scan_count=AGENT_STATE["scan_count"] + 1)
 
         if signals:
-            # Pick best signal based on score (9 or 10)
-            def score(sig): return sig.get("score", 0)
-            best = max(signals, key=score)
+            # Pick best signal based on score (13-15)
+            best = max(signals, key=lambda x: x.get("score", 0))
             logger.info("🏆 Best Signal: %s %s (Score: %d)", best["direction"], best["symbol"], best["score"])
             
             added = await add_trade(best)
             if added:
                 update_state(last_signal=best, signal_count=AGENT_STATE["signal_count"] + 1)
         else:
-            logger.info("✗ No valid setup this cycle")
+            logger.info("✗ No valid setup found across all 15 batches")
 
     except Exception as exc:
         logger.error("Cycle crashed: %s", exc, exc_info=True)
@@ -159,7 +146,7 @@ async def signal_loop():
             wait_sec = _seconds_to_next_scan_boundary()
         else:
             wait_sec = _seconds_until_next_window()
-            logger.info("[%s] Outside hours — sleeping %s", day, _fmt_sleep(wait_sec))
+            logger.info("[%s] Outside hours — sleeping %s", day, f"{int(wait_sec//3600)}h {int((wait_sec%3600)//60)}m")
 
         try:
             await asyncio.wait_for(scan_event.wait(), timeout=wait_sec)
@@ -172,12 +159,11 @@ async def main():
     AGENT_STATE["scan_trigger"] = asyncio.Event()
 
     logger.info("╔══════════════════════════════════════════════╗")
-    logger.info("║  Binance Agent — v5.1 OPENROUTER + BTC CTX  ║")
+    logger.info("║  Binance Agent — v6 PARALLEL ENGINE         ║")
     logger.info("╚══════════════════════════════════════════════╝")
     logger.info("Model: %s", OPENROUTER_MODEL)
-    logger.info("Timeframes: 1D(50) + 4H(150) + 1H(100) + 15m(100)")
-    logger.info("Coins: %d | Batch size: %d (+ BTC)", TOP_COINS_LIMIT, BATCH_SIZE)
-    logger.info("Total API Keys: %d", len(OPENROUTER_API_KEYS))
+    logger.info("Coins: %d | Batch size: %d (Total batches: %d)", TOP_COINS_LIMIT, BATCH_SIZE, TOP_COINS_LIMIT//BATCH_SIZE)
+    logger.info("API Keys: %d", len(OPENROUTER_API_KEYS))
     logger.info("Trading hours: %s – %s SLST", SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
 
     await asyncio.gather(
