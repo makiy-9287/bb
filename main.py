@@ -10,9 +10,10 @@ from typing import Any, Dict, List
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
-    TOP_COINS_LIMIT, BATCH_SIZE, OPENROUTER_API_KEYS,
+    TOP_COINS_LIMIT, BATCH_SIZE, OPENROUTER_API_KEYS, OPENROUTER_MODEL, # 👈 OPENROUTER_MODEL මෙතනට add කළා
     SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
     CANDLE_COUNTS, MONITOR_INTERVAL_SEC
+
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
