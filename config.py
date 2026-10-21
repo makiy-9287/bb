@@ -59,7 +59,7 @@ CLOSED_TRADES_FILE   = "closed_trades.json"
 
 # ── Execution Window (09:30 AM - 05:00 PM SLST) ──────────────────
 SLST_START       = dt_time(9, 30)
-SLST_END         = dt_time(22, 0)
+SLST_END         = dt_time(17, 0)
 SLST_UTC_OFFSET  = 5.5
 
 # ── Trading Days ─────────────────────────────────────────────────
