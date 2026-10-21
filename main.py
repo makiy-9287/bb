@@ -1,5 +1,5 @@
 """
-v5 Main orchestrator — Multi-Key Rotation.
+v5.1 Main orchestrator — Multi-Key, BTC Context Injection.
 """
 import asyncio
 import logging
@@ -10,10 +10,9 @@ from typing import Any, Dict, List
 
 from config import (
     SLST_START, SLST_END, SLST_UTC_OFFSET,
-    TOP_COINS_LIMIT, BATCH_SIZE, OPENROUTER_API_KEYS, OPENROUTER_MODEL, # 👈 OPENROUTER_MODEL මෙතනට add කළා
+    TOP_COINS_LIMIT, BATCH_SIZE, OPENROUTER_API_KEYS, OPENROUTER_MODEL,
     SCAN_INTERVAL_MIN, OFF_WEEKDAYS, DAY_NAMES,
     CANDLE_COUNTS, MONITOR_INTERVAL_SEC
-
 )
 from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
@@ -35,7 +34,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
 
-# Initialize Key Manager
 key_manager = KeyManager(OPENROUTER_API_KEYS)
 
 def in_execution_window() -> bool:
@@ -73,8 +71,6 @@ def _fmt_sleep(s: float) -> str:
 
 async def signal_cycle():
     cycle_start = time.time()
-    
-    # ── ROTATE API KEY AT THE START OF EVERY SCAN ──
     current_api_key = key_manager.rotate()
     
     logger.info("═══ Signal cycle starting (Key: ...%s) ═══", current_api_key[-4:])
@@ -103,14 +99,28 @@ async def signal_cycle():
         if not all_data:
             return
 
+        # ── Extract BTC Data for Context ──
+        btc_data = next((d for d in all_data if d["symbol"] == "BTCUSDT"), None)
+        if btc_data:
+            logger.info("✅ BTCUSDT Context loaded for injection.")
+        else:
+            logger.warning("⚠️ BTCUSDT not found in top coins list! Context missing.")
+
         # Split into batches (70 / 10 = 7 batches)
         batches = [all_data[i:i + BATCH_SIZE] for i in range(0, len(all_data), BATCH_SIZE)]
         logger.info("Step 4/4 — Split into %d batches of %d coins", len(batches), BATCH_SIZE)
 
         signals = []
         for i, batch_data in enumerate(batches, 1):
-            logger.info("▶️ Processing Batch %d/%d (Key: ...%s) …", i, len(batches), current_api_key[-4:])
-            payload = build_payload(batch_data)
+            # 🚨 Inject BTC into this batch if it's not already there
+            current_batch = list(batch_data)
+            if btc_data and not any(d["symbol"] == "BTCUSDT" for d in current_batch):
+                current_batch.insert(0, btc_data)
+
+            logger.info("▶️ Processing Batch %d/%d (%d coins incl BTC) (Key: ...%s) …", 
+                        i, len(batches), len(current_batch), current_api_key[-4:])
+            
+            payload = build_payload(current_batch)
             signal = await run_agent(payload, current_api_key)
 
             if signal:
@@ -120,7 +130,7 @@ async def signal_cycle():
         update_state(last_scan_at=datetime.now(SLST_TZ), scan_count=AGENT_STATE["scan_count"] + 1)
 
         if signals:
-            # Pick best signal
+            # Pick best signal based on score (9 or 10)
             def score(sig): return sig.get("score", 0)
             best = max(signals, key=score)
             logger.info("🏆 Best Signal: %s %s (Score: %d)", best["direction"], best["symbol"], best["score"])
@@ -162,11 +172,11 @@ async def main():
     AGENT_STATE["scan_trigger"] = asyncio.Event()
 
     logger.info("╔══════════════════════════════════════════════╗")
-    logger.info("║  Binance Agent — v5 OPENROUTER MULTI-KEY    ║")
+    logger.info("║  Binance Agent — v5.1 OPENROUTER + BTC CTX  ║")
     logger.info("╚══════════════════════════════════════════════╝")
     logger.info("Model: %s", OPENROUTER_MODEL)
     logger.info("Timeframes: 1D(50) + 4H(150) + 1H(100) + 15m(100)")
-    logger.info("Coins: %d | Batch size: %d", TOP_COINS_LIMIT, BATCH_SIZE)
+    logger.info("Coins: %d | Batch size: %d (+ BTC)", TOP_COINS_LIMIT, BATCH_SIZE)
     logger.info("Total API Keys: %d", len(OPENROUTER_API_KEYS))
     logger.info("Trading hours: %s – %s SLST", SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
 
