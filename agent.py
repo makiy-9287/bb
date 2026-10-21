@@ -29,6 +29,13 @@ You analyze a batch of 10 coins and score them.
 You ONLY emit a signal if the score is 8, 9, or 10 (out of 10). 
 If the best setup in the batch scores 7 or below, you MUST NOT call the tool. You must reply with the exact text: "NO_SETUP".
 
+## BTC MACRO CONTEXT (CRITICAL)
+The FIRST coin in the payload is always BTCUSDT. You MUST analyze BTC's 1D and 4H trend BEFORE looking at the altcoins.
+- If BTC is bearish, be extremely careful with LONGs. Look for SHORTs on altcoins.
+- If BTC is bullish, prioritize LONGs.
+- If an altcoin setup completely contradicts BTC's strong trend, reject it (score < 9).
+- Also the Sri lankan time zone 10:00 am - 20:00 pm the session time. so the alt coin are gonna be Long side.
+
 ## DATA FORMAT
 You get up to 10 coins per batch. Each coin has:
 - 1d (50), 4h (150), 1h (100), 15m (100) candles: [high, low, close, volume].
@@ -86,7 +93,7 @@ TOOLS = [{
                 "tp2":        {"type": "number"},
                 "tp3":        {"type": "number"},
                 "confidence": {"type": "string", "enum": ["high"]},
-                "score":      {"type": "integer", "description": "Setup score out of 10. Must be 8, 9, or 10."},
+                "score":      {"type": "integer", "Setup score out of 10. Must be , 9, or 10."},
                 "reason":     {"type": "string"},
             },
             "required": ["symbol", "direction", "entry", "sl",
