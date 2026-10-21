@@ -1,5 +1,5 @@
 """
-v5 Agent — OpenRouter (Nemotron 3 Ultra) with dynamic API key.
+v6 Agent — 15-Point Scoring for A+ Setups.
 """
 import asyncio
 import json
@@ -10,11 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
-
-from config import (
-    OPENROUTER_BASE_URL, OPENROUTER_MODEL,
-    REASONING_EFFORT,
-)
+from config import OPENROUTER_BASE_URL, OPENROUTER_MODEL, REASONING_EFFORT
 from telegram_sender import send_signal
 
 logger = logging.getLogger(__name__)
@@ -23,31 +19,24 @@ _API_RETRIES = 3
 SYSTEM_PROMPT = """
 You are an elite ICT/SMC trader managing a hedge fund.
 Your ONLY job is to find the absolute BEST setups. Capital preservation is priority #1.
-You analyze a batch of 10 coins and score them.
+You analyze a batch of 4 coins and score them.
 
 ## STRICT RULE
-You ONLY emit a signal if the score is 8, 9, or 10 (out of 10). 
-If the best setup in the batch scores 7 or below, you MUST NOT call the tool. You must reply with the exact text: "NO_SETUP".
-
-## BTC MACRO CONTEXT (CRITICAL)
-The FIRST coin in the payload is always BTCUSDT. You MUST analyze BTC's 1D and 4H trend BEFORE looking at the altcoins.
-- If BTC is bearish, be extremely careful with LONGs. Look for SHORTs on altcoins.
-- If BTC is bullish, prioritize LONGs.
-- If an altcoin setup completely contradicts BTC's strong trend, reject it (score < 9).
-- Also the Sri lankan time zone 10:00 am - 20:00 pm the session time. so the alt coin are gonna be Long side.
+You ONLY emit a signal if the score is 13, 14, or 15 (out of 15). 
+If the best setup in the batch scores 12 or below, you MUST NOT call the tool. Reply with exact text: "NO_SETUP".
 
 ## DATA FORMAT
-You get up to 10 coins per batch. Each coin has:
-- 1d (50), 4h (150), 1h (100), 15m (100) candles: [high, low, close, volume].
+You get 4 coins per batch. Each coin has:
+- 1d (100), 4h (250), 1h (200), 15m (150) candles: [high, low, close, volume].
 
-## THE 10-POINT SCORING SYSTEM
-1. **Market Structure (2 pts):** 
-   - 2 pts: Clear BOS/CHoCH on 15m AND 1H in same direction + 4H/1D Trend aligned.
-   - 1 pt: 15m only, or conflicting 1H.
+## THE 15-POINT SCORING SYSTEM (Need 13+ to pass)
+1. **Market Structure (SMC/ICT) (3 pts):**
+   - 3 pts: Clear BOS/CHoCH on 15m AND 1H aligned with 4H/1D.
+   - 1-2 pts: Minor structure breaks or mixed timeframes.
    - 0 pts: Choppy.
 
 2. **Liquidity Sweep (2 pts):**
-   - 2 pts: Recent sweep of MAJOR liquidity (1H swing) + strong rejection + 15m CHoCH.
+   - 2 pts: Recent sweep of a MAJOR 1H/4H swing high/low + strong rejection + 15m CHoCH.
    - 1 pt: Minor 15m sweep.
    - 0 pts: No sweep.
 
@@ -61,43 +50,54 @@ You get up to 10 coins per batch. Each coin has:
    - 1 pt: In zone, but not near POC.
    - 0 pts: Equilibrium.
 
-5. **Momentum (2 pts):**
+5. **Momentum (RSI/MA/Vol) (2 pts):**
    - 2 pts: RSI supportive + MAs aligned + Volume confirms.
    - 1 pt: Mixed indicators.
-   - 0 pts: RSI overbought/oversold against you.
+   - 0 pts: Conflicting.
 
-## HOW TO CALCULATE SL / TP
-- **SL:** 3-5 ticks beyond swept low/high or OB edge + 0.2x ATR buffer.
-- **TP1:** Nearest 1H opposing liquidity (1R-1.5R).
-- **TP2:** Next 1H swing extreme (2R).
-- **TP3:** 3R.
+6. **Classical S&R / Trendlines (2 pts):**
+   - 2 pts: Price is bouncing off a major 4H/1H Support/Resistance zone OR a respected multi-touch trendline.
+   - 1 pt: Minor S&R or weak trendline.
+   - 0 pts: No classical S&R support.
+
+7. **Fibonacci Confluence (2 pts):**
+   - 2 pts: The entry is perfectly inside the 0.618 - 0.786 Golden Zone of a major 1H/4H swing AND aligns with an OB.
+   - 1 pt: Near the Fib zone.
+   - 0 pts: No Fib alignment.
+
+## STRICT SL / TP RULES (LIQUIDITY BASED)
+- **SL:** Do NOT use arbitrary tight stops. Place SL exactly 3-5 ticks BEYOND the recent swept wick (the extreme low for LONG, high for SHORT) + a 0.2x ATR buffer.
+- **TPs:** Do NOT use fixed 1R, 2R, 3R. Look at the chart and find the NEXT high-probability Liquidity Pools (S/R, OB, BB, Equal Highs/Lows).
+  * **TP1:** Nearest 15m/1H minor liquidity pool.
+  * **TP2:** Next 1H major liquidity pool or 4H OB.
+  * **TP3:** 4H/1D major liquidity zone.
+  * *Distance does not matter, target the actual market structure.*
 
 ## OUTPUT
-If Score >= 8, call `send_trade_signal` with confidence="high".
-If Score < 8, reply exactly "NO_SETUP".
+If Score >= 13, call `send_trade_signal` with confidence="high".
+If Score < 13, reply exactly "NO_SETUP".
 """
 
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "send_trade_signal",
-        "description": "Send a confirmed trade signal to Telegram. ONLY use if score >= 8.",
+        "description": "Send a confirmed trade signal. ONLY use if score >= 13.",
         "parameters": {
             "type": "object",
             "properties": {
                 "symbol":     {"type": "string"},
                 "direction":  {"type": "string", "enum": ["LONG", "SHORT"]},
                 "entry":      {"type": "number"},
-                "sl":         {"type": "number"},
+                "sl":         {"type": "number", "description": "Beyond the swept wick + ATR buffer"},
                 "tp1":        {"type": "number"},
                 "tp2":        {"type": "number"},
                 "tp3":        {"type": "number"},
                 "confidence": {"type": "string", "enum": ["high"]},
-                "score":      {"type": "integer", "Setup score out of 10. Must be , 9, or 10."},
-                "reason":     {"type": "string"},
+                "score":      {"type": "integer", "description": "Score out of 15. MUST be 13, 14, or 15."},
+                "reason":     {"type": "string", "description": "Internal log only, not shown to users"},
             },
-            "required": ["symbol", "direction", "entry", "sl",
-                         "tp1", "tp2", "tp3", "confidence", "score", "reason"],
+            "required": ["symbol", "direction", "entry", "sl", "tp1", "tp2", "tp3", "confidence", "score", "reason"],
         },
     },
 }]
@@ -108,33 +108,19 @@ def _build_request_kwargs() -> dict:
         "tools": TOOLS,
         "tool_choice": "auto",
         "max_tokens": 16000,
-    }
-    # Nemotron uses standard OpenAI reasoning format
-    kwargs["reasoning_effort"] = REASONING_EFFORT
-    kwargs["extra_body"] = {
-        "reasoning": {"effort": REASONING_EFFORT},
-        "include_reasoning": True
+        "reasoning_effort": REASONING_EFFORT,
+        "extra_body": {"reasoning": {"effort": REASONING_EFFORT}, "include_reasoning": True}
     }
     return kwargs
 
-def _save_reasoning(reasoning: str):
-    try:
-        os.makedirs("debug_reasoning", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        with open(f"debug_reasoning/{ts}.txt", "w", encoding="utf-8") as f:
-            f.write(reasoning)
-    except Exception:
-        pass
-
 async def run_agent(payload_json: str, api_key: str) -> Optional[Dict[str, Any]]:
     if not api_key:
-        logger.error("API Key is empty!")
         return None
 
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
-        default_headers={"HTTP-Referer": "https://github.com/makiy-9287/bb", "X-Title": "SMC Trading Bot"}
+        default_headers={"HTTP-Referer": "https://github.com/makiy-9287/bb", "X-Title": "SMC Bot"}
     )
 
     messages = [
@@ -151,50 +137,36 @@ async def run_agent(payload_json: str, api_key: str) -> Optional[Dict[str, Any]]
             break
         except Exception as exc:
             if attempt == _API_RETRIES - 1:
-                logger.error("Agent API failed after %d attempts: %s", _API_RETRIES, exc)
+                logger.error("API failed: %s", exc)
                 return None
-            
-            # Exponential backoff with jitter for rate limits
-            wait = (2 ** attempt) + random.uniform(0, 1)
-            logger.warning("API err (%d/%d): %s — retry in %.1fs", attempt + 1, _API_RETRIES, exc, wait)
-            await asyncio.sleep(wait)
+            await asyncio.sleep((2 ** attempt) + random.uniform(0, 1))
 
     if response is None or not response.choices:
-        logger.error("AI returned empty response")
         return None
 
     msg = response.choices[0].message
-    
-    # Extract reasoning (OpenRouter sends this differently sometimes)
     reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
     if reasoning:
-        logger.info("🧠 Reasoning (%d chars): %s …", len(reasoning), reasoning[:300].replace("\n", " "))
-        _save_reasoning(reasoning)
+        logger.info("🧠 Reasoned (%d chars)", len(reasoning))
 
     if not msg.tool_calls:
-        content = (msg.content or "").strip()
-        logger.info("Agent reply: %s", content[:150] if content else "NO_SETUP")
         return None
 
     args_str = msg.tool_calls[0].function.arguments or ""
-    if not args_str:
-        return None
-
     try:
         args = json.loads(args_str)
-    except json.JSONDecodeError:
-        logger.error("Bad tool args: %s", args_str)
+    except:
         return None
 
-    # ── 🚨 SAFETY CHECK ─────────────────────────────────────────────
+    # ── 🚨 SAFETY CHECK (Score >= 13) ──────────────────────────────
     score = args.get("score", 0)
     reason_text = str(args.get("reason", "")).upper()
     
-    if score < 8 or "INVALID" in reason_text or "DO NOT EXECUTE" in reason_text:
-        logger.warning(f"🚫 BLOCKED: AI tried to send a bad signal (Score: {score}). Rejected.")
+    if score < 13 or "INVALID" in reason_text:
+        logger.warning(f"🚫 BLOCKED: Low Score ({score}/15). Rejected.")
         return None
 
-    logger.info("🚀 Signal: %s %s | Score: %d/10", args["direction"], args["symbol"], score)
+    logger.info("🚀 Valid Signal: %s %s | Score: %d/15", args["direction"], args["symbol"], score)
 
     if await send_signal(args):
         return args
