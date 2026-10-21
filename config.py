@@ -59,7 +59,7 @@ ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
 
 # ── Execution Window (10:00 AM - 08:00 PM SLST) ──────────────────
-SLST_START       = dt_time(10, 0)
+SLST_START       = dt_time(9, 0)
 SLST_END         = dt_time(20, 0)
 SLST_UTC_OFFSET  = 5.5
 
