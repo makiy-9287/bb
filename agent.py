@@ -22,14 +22,14 @@ Your ONLY job is to find the absolute BEST setups. Capital preservation is prior
 You analyze a batch of 4 coins and score them.
 
 ## STRICT RULE
-You ONLY emit a signal if the score is 13, 14, or 15 (out of 15). 
+You ONLY emit a signal if the score is  14, or 15 (out of 15). 
 If the best setup in the batch scores 12 or below, you MUST NOT call the tool. Reply with exact text: "NO_SETUP".
 
 ## DATA FORMAT
 You get 4 coins per batch. Each coin has:
 - 1d (100), 4h (250), 1h (200), 15m (150) candles: [high, low, close, volume].
 
-## THE 15-POINT SCORING SYSTEM (Need 13+ to pass)
+## THE 15-POINT SCORING SYSTEM (Need 14+ to pass)
 1. **Market Structure (SMC/ICT) (3 pts):**
    - 3 pts: Clear BOS/CHoCH on 15m AND 1H aligned with 4H/1D.
    - 1-2 pts: Minor structure breaks or mixed timeframes.
@@ -74,15 +74,15 @@ You get 4 coins per batch. Each coin has:
   * *Distance does not matter, target the actual market structure.*
 
 ## OUTPUT
-If Score >= 13, call `send_trade_signal` with confidence="high".
-If Score < 13, reply exactly "NO_SETUP".
+If Score >= 14, call `send_trade_signal` with confidence="high".
+If Score < 14, reply exactly "NO_SETUP".
 """
 
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "send_trade_signal",
-        "description": "Send a confirmed trade signal. ONLY use if score >= 13.",
+        "description": "Send a confirmed trade signal. ONLY use if score >= 14.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -94,7 +94,7 @@ TOOLS = [{
                 "tp2":        {"type": "number"},
                 "tp3":        {"type": "number"},
                 "confidence": {"type": "string", "enum": ["high"]},
-                "score":      {"type": "integer", "description": "Score out of 15. MUST be 13, 14, or 15."},
+                "score":      {"type": "integer", "description": "Score out of 15. MUST be 14, or 15."},
                 "reason":     {"type": "string", "description": "Internal log only, not shown to users"},
             },
             "required": ["symbol", "direction", "entry", "sl", "tp1", "tp2", "tp3", "confidence", "score", "reason"],
