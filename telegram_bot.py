@@ -14,7 +14,7 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     SLST_START, SLST_END, SLST_UTC_OFFSET,
     SCAN_INTERVAL_MIN, TOP_COINS_LIMIT,
-    DEEPSEEK_MODEL, REASONING_EFFORT,
+    OPENROUTER_MODEL, REASONING_EFFORT,  # 👈 මෙතන වෙනස් කළා
     OFF_WEEKDAYS, DAY_NAMES,
 )
 
@@ -160,8 +160,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Last signal: `{sig_str}`\n"
         f"⏭ {next_evt}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ `{DEEPSEEK_MODEL}` | 🧠 `{REASONING_EFFORT}`\n"
-        f"🪙 `{TOP_COINS_LIMIT}` coins | `4H/1H/15m`"
+        f"⚙️ `{OPENROUTER_MODEL}` | 🧠 `{REASONING_EFFORT}`\n" # 👈 මෙතනත් වෙනස් කළා
+        f"🪙 `{TOP_COINS_LIMIT}` coins | `1D/4H/1H/15m`" # 👈 1D එකතු කළා
     )
 
 
