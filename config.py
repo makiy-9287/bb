@@ -30,7 +30,7 @@ TELEGRAM_BROADCAST_IDS = _ids
 
 # ── Binance ──────────────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 70   # 70 Coins
+TOP_COINS_LIMIT      = 60   # 70 Coins
 BATCH_SIZE           = 10   # 10 ගානෙ Batch යනවා (7 batches per scan)
 
 # ── Timeframes & Candles (1D එකතු කළා) ───────────────────────────
@@ -50,7 +50,7 @@ CANDLE_COUNTS = {
 }
 
 # ── Scan Settings ────────────────────────────────────────────────
-SCAN_INTERVAL_MIN = 30
+SCAN_INTERVAL_MIN = 45
 
 # ── Trade Management ─────────────────────────────────────────────
 MAX_ACTIVE_TRADES    = 50
