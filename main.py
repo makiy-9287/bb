@@ -119,7 +119,7 @@ async def signal_cycle():
 
         if signals:
             # Pick best signal based on score (13-15)
-            best = max(signals, key=lambda x: x.get("score", 0))
+            best = max(signals, key=lambda x: x.get("", 0))
             logger.info("🏆 Best Signal: %s %s (Score: %d)", best["direction"], best["symbol"], best["score"])
             
             added = await add_trade(best)
