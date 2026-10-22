@@ -1,6 +1,6 @@
 """
 Trade monitor — limit fills, TP1→TP2→TP3 tracking, no SL move after TP1.
-Uses 1m high/low to catch wicks.
+Fixed: KeyError on 'tp_hits' for legacy trades.
 """
 import asyncio
 import json
@@ -124,7 +124,7 @@ async def add_trade(signal: Dict[str, Any]):
         t = dict(signal)
         t["opened_at"] = datetime.utcnow().isoformat()
         t["status"] = "pending" if t.get("entry_type") == "LIMIT" else "open"
-        t["tp_hits"] = []
+        t["tp_hits"] = []  # always initialize
         trades.append(t)
         _save(ACTIVE_TRADES_FILE, trades)
     logger.info("Trade added: %s (%s)", signal["symbol"], t["status"])
@@ -161,8 +161,11 @@ async def monitor_loop():
                     d = t["direction"].upper()
                     pd = data.get(sym)
 
+                    # Auto-init tp_hits for legacy trades
+                    if "tp_hits" not in t:
+                        t["tp_hits"] = []
+
                     if st == "pending":
-                        # Check limit fill
                         if pd is None:
                             remaining.append(t)
                             continue
@@ -187,7 +190,6 @@ async def monitor_loop():
                         tp1, tp2, tp3 = (float(t["tp1"]), float(t["tp2"]),
                                          float(t["tp3"]))
 
-                        # SL check (original SL, no move after TP1)
                         sl_hit = (
                             (d == "LONG" and pd["low"] <= sl)
                             or (d == "SHORT" and pd["high"] >= sl)
@@ -204,7 +206,6 @@ async def monitor_loop():
                                              t["pnl_pct"]))
                             continue
 
-                        # TP progression
                         if d == "LONG":
                             if st == "open" and pd["high"] >= tp1:
                                 t["status"] = "tp1_hit"
@@ -253,7 +254,6 @@ async def monitor_loop():
 
                 _save(ACTIVE_TRADES_FILE, remaining)
 
-            # Notifications outside lock
             for sym, d, px in fills:
                 await send_raw_message(
                     f"✅ *Entry Filled* — `{sym}`\n"
