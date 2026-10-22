@@ -1,5 +1,6 @@
 """
-Telegram command bot — /start /help /status /trades /pnl /scan.
+Admin-only Telegram command bot.
+Broadcast IDs receive signals but cannot issue commands.
 """
 import asyncio
 import logging
@@ -8,22 +9,17 @@ from typing import Any, Dict
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.request import HTTPXRequest
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID,
     SLST_START, SLST_END, SLST_UTC_OFFSET,
     SCAN_INTERVAL_MIN, TOP_COINS_LIMIT,
-    OPENROUTER_MODEL, REASONING_EFFORT,  # 👈 මෙතන වෙනස් කළා
+    OPENROUTER_MODEL, REASONING_EFFORT,
     OFF_WEEKDAYS, DAY_NAMES,
 )
 
 logger = logging.getLogger(__name__)
 SLST_TZ = timezone(timedelta(hours=SLST_UTC_OFFSET))
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 
 
 AGENT_STATE: Dict[str, Any] = {
@@ -40,10 +36,10 @@ def update_state(**kwargs):
     AGENT_STATE.update(kwargs)
 
 
-def _authorized(update: Update) -> bool:
+def _is_admin(update: Update) -> bool:
     if not update.effective_chat:
         return False
-    return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
+    return str(update.effective_chat.id) == str(TELEGRAM_ADMIN_ID)
 
 
 def _slst_now() -> datetime:
@@ -86,69 +82,53 @@ async def _reply(update: Update, text: str) -> None:
         logger.warning("Reply failed: %s", exc)
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not chat:
-        return
-    if _authorized(update):
-        await _reply(update,
-            "🤖 *Agent Commands*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "/status — agent health\n"
-            "/trades — active trades\n"
-            "/pnl    — performance summary\n"
-            "/scan   — trigger manual scan\n"
-            "/help   — this message"
-        )
-    else:
-        await _reply(update,
-            f"👋 *Welcome!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Your Telegram Chat ID:\n`{chat.id}`\n\n"
-            f"Send this to the bot admin."
-        )
-
-
+# ── commands ─────────────────────────────────────────────────────
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        await cmd_start(update, context)
+    if not _is_admin(update):
         return
     await _reply(update,
-        "🤖 *Agent Commands*\n"
+        "🤖 *v6 ULTRA Commands*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/status /trades /pnl /scan /help"
+        "/status — agent health & schedule\n"
+        "/trades — active + pending trades\n"
+        "/pnl    — performance summary\n"
+        "/scan   — trigger manual scan\n"
+        "/help   — this message"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
+    if not _is_admin(update):
         return
+
     now = _slst_now()
     day = DAY_NAMES[now.weekday()]
+    in_win = _in_window(now)
+
     started = AGENT_STATE.get("started_at")
     uptime = _fmt_dur((now - started).total_seconds()) if started else "?"
 
-    if _in_window(now):
+    if in_win:
         m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
         next_evt = f"next scan in {m}m"
         status_line = "🟢 *ACTIVE*"
     elif now.weekday() in OFF_WEEKDAYS:
-        wait_s = (_next_window_start(now) - now).total_seconds()
-        next_evt = f"next Mon in {_fmt_dur(wait_s)}"
+        wait = (_next_window_start(now) - now).total_seconds()
+        next_evt = f"sleeps until Mon {SLST_START.strftime('%H:%M')} ({_fmt_dur(wait)})"
         status_line = "😴 *OFF-DAY*"
     else:
-        wait_s = (_next_window_start(now) - now).total_seconds()
-        next_evt = f"next window in {_fmt_dur(wait_s)}"
+        wait = (_next_window_start(now) - now).total_seconds()
+        next_evt = f"next window in {_fmt_dur(wait)}"
         status_line = "⏸ *OUTSIDE HOURS*"
 
     ls = AGENT_STATE.get("last_scan_at")
     ls_str = ls.strftime("%H:%M:%S SLST") if ls else "—"
     sig = AGENT_STATE.get("last_signal")
-    sig_str = (f"{sig['direction']} {sig['symbol']} "
-               f"({sig.get('confidence','?')})" if sig else "—")
+    sig_str = (f"{sig['direction']} {sig['symbol']} ({sig.get('confidence','?')})"
+               if sig else "—")
 
     await _reply(update,
-        f"🤖 *Agent Status*\n"
+        f"🤖 *v6 ULTRA Status*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{status_line}\n"
         f"📅 `{day}` | `{now.strftime('%H:%M:%S')} SLST`\n"
@@ -160,56 +140,73 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Last signal: `{sig_str}`\n"
         f"⏭ {next_evt}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ `{OPENROUTER_MODEL}` | 🧠 `{REASONING_EFFORT}`\n" # 👈 මෙතනත් වෙනස් කළා
-        f"🪙 `{TOP_COINS_LIMIT}` coins | `1D/4H/1H/15m`" # 👈 1D එකතු කළා
+        f"🧠 `{OPENROUTER_MODEL}`\n"
+        f"⚙️ Reasoning: `{REASONING_EFFORT}`\n"
+        f"🪙 `{TOP_COINS_LIMIT}` coins | `1D/4H/1H/15m`"
     )
 
 
 async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
+    if not _is_admin(update):
         return
-    from trade_monitor import get_active_trades, get_prices, calc_pnl
-    trades = get_active_trades()
-    if not trades:
-        await _reply(update, "📭 No active trades.")
+    from trade_monitor import get_active_trades, get_pending_trades, get_prices, calc_pnl
+
+    pending = get_pending_trades()
+    active = get_active_trades()
+    if not pending and not active:
+        await _reply(update, "📭 No trades.")
         return
-    symbols = list({t["symbol"] for t in trades})
+
+    symbols = list({t["symbol"] for t in pending + active})
     try:
         prices = await get_prices(symbols)
     except Exception:
         prices = {}
-    lines = ["📊 *Active Trades*", "━━━━━━━━━━━━━━━━━━━━"]
-    for t in trades:
+
+    lines = ["📊 *Trades*", "━━━━━━━━━━━━━━━━━━━━"]
+
+    for t in pending:
+        d = t["direction"].upper()
+        emoji = "🟡"
+        lines.append(
+            f"{emoji} `{t['symbol']}` *{d}* LIMIT @ `{float(t['entry']):.6g}`\n"
+            f"   Zone: `{float(t.get('zone_low', 0)):.6g}` – "
+            f"`{float(t.get('zone_high', 0)):.6g}`"
+        )
+
+    for t in active:
         sym, d = t["symbol"], t["direction"].upper()
         entry = float(t["entry"])
         price = prices.get(sym)
         emoji = "🟢" if d == "LONG" else "🔴"
-        pnl_str = f"{calc_pnl(t, price)['pnl_pct']:+.2f}%" if price else "N/A"
-        tps = []
-        if t.get("tp1_hit"): tps.append("TP1✓")
-        if t.get("tp2_hit"): tps.append("TP2✓")
-        tps_mark = f" [{','.join(tps)}]" if tps else ""
+        pnl_str = (f"{calc_pnl(t, price)['pnl_pct']:+.2f}%"
+                   if price else "N/A")
+        status = t.get("status", "open")
         lines.append(
-            f"{emoji} `{sym}` *{d}* — `{pnl_str}`{tps_mark}\n"
-            f"  E: `{entry:.6g}` | SL: `{float(t['sl']):.6g}`\n"
-            f"  TP1: `{float(t['tp1']):.6g}` | "
+            f"{emoji} `{sym}` *{d}* `{status}` — PnL: `{pnl_str}`\n"
+            f"   E: `{entry:.6g}` | SL: `{float(t['sl']):.6g}`\n"
+            f"   TP1: `{float(t['tp1']):.6g}` | "
             f"TP2: `{float(t['tp2']):.6g}` | "
             f"TP3: `{float(t['tp3']):.6g}`"
         )
+
     await _reply(update, "\n".join(lines))
 
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
+    if not _is_admin(update):
         return
     from trade_monitor import get_closed_trades
+
     closed = get_closed_trades()
     if not closed:
-        await _reply(update, "📭 No closed trades yet.")
+        await _reply(update, "📭 No closed trades.")
         return
+
     wins = losses = 0
     total = 0.0
     best = worst = None
+
     for t in closed:
         e = float(t["entry"])
         x = float(t.get("exit_price", e))
@@ -218,16 +215,22 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pct = ((x - e) / e * 100) if t["direction"].upper() == "LONG" \
               else ((e - x) / e * 100)
         total += pct
-        wins += 1 if pct >= 0 else 0
-        losses += 1 if pct < 0 else 0
-        if best is None or pct > best[0]:  best = (pct, t)
-        if worst is None or pct < worst[0]: worst = (pct, t)
+        if pct >= 0:
+            wins += 1
+        else:
+            losses += 1
+        if best is None or pct > best[0]:
+            best = (pct, t)
+        if worst is None or pct < worst[0]:
+            worst = (pct, t)
+
     n = wins + losses
     wr = (wins / n * 100) if n else 0
     b_str = f"+{best[0]:.2f}% ({best[1]['symbol']})" if best else "—"
     w_str = f"{worst[0]:.2f}% ({worst[1]['symbol']})" if worst else "—"
+
     await _reply(update,
-        f"📈 *Performance Summary*\n"
+        f"📈 *Performance*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Total: `{n}` | ✅ `{wins}` | ❌ `{losses}`\n"
         f"Win rate: `{wr:.1f}%`\n"
@@ -239,7 +242,7 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
+    if not _is_admin(update):
         return
     ev = AGENT_STATE.get("scan_trigger")
     if ev is None:
@@ -249,32 +252,15 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply(update, "🚀 Manual scan triggered.")
 
 
-def _on_polling_error(exc: Exception) -> None:
-    """MUST be a regular function (not async) per python-telegram-bot v21."""
-    logger.warning("Telegram polling hiccup: %s — retrying", type(exc).__name__)
-
-
+# ── lifecycle ────────────────────────────────────────────────────
 async def telegram_bot_loop():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not set — bot disabled")
         return
 
-    request = HTTPXRequest(
-        connection_pool_size=8,
-        connect_timeout=30.0,
-        read_timeout=60.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .get_updates_request(request)
-        .build()
-    )
-    app.add_handler(CommandHandler("start",  cmd_start))
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("start",  cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
@@ -282,30 +268,12 @@ async def telegram_bot_loop():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(
-        drop_pending_updates=True,
-        error_callback=_on_polling_error,
-    )
-    logger.info("Telegram bot started — /start /help /status /trades /pnl /scan")
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram bot started — admin-only commands")
 
     try:
         await asyncio.Event().wait()
     finally:
-        try:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-        except Exception as exc:
-            logger.warning("Shutdown error: %s", exc)
-
-
-async def telegram_bot_supervisor():
-    while True:
-        try:
-            await telegram_bot_loop()
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("Bot crashed: %s — restart in 30s", exc)
-            await asyncio.sleep(30)
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
