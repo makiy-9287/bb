@@ -1,5 +1,6 @@
 """
-v6 Configuration — Parallel Multi-Key, 60 Coins, 15-Point Scoring.
+v6 ULTRA — Configuration.
+OpenRouter + Nemotron 3 Ultra, 15 API keys, 60 coins, 4 timeframes.
 """
 import os
 from dotenv import load_dotenv
@@ -7,65 +8,62 @@ from datetime import time as dt_time
 
 load_dotenv()
 
-# ── OpenRouter Credentials ───────────────────────────────────────
-_raw_keys = os.getenv("OPENROUTER_API_KEYS", "")
-OPENROUTER_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+# ── OpenRouter (15 keys) ─────────────────────────────────────────
+OPENROUTER_API_KEYS = []
+for i in range(1, 16):
+    k = os.getenv(f"OPENROUTER_API_KEY_{i}", "").strip()
+    if k:
+        OPENROUTER_API_KEYS.append(k)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-
-# ── Reasoning ────────────────────────────────────────────────────
-REASONING_EFFORT = os.getenv("REASONING_EFFORT", "high")
+OPENROUTER_MODEL    = "nvidia/nemotron-3-ultra-550b-a55b:free"
+REASONING_EFFORT    = os.getenv("REASONING_EFFORT", "high")
 
 # ── Telegram ─────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ADMIN_ID  = os.getenv("TELEGRAM_ADMIN_ID", "")
+TELEGRAM_BROADCAST_IDS = [
+    x.strip() for x in os.getenv("TELEGRAM_BROADCAST_IDS", "").split(",")
+    if x.strip()
+]
 
-_raw = os.getenv("TELEGRAM_BROADCAST_IDS", "")
-_ids = [x.strip() for x in _raw.split(",") if x.strip()]
-if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in _ids:
-    _ids.insert(0, TELEGRAM_CHAT_ID)
-TELEGRAM_BROADCAST_IDS = _ids
-
-# ── Binance ──────────────────────────────────────────────────────
+# ── Binance Futures ──────────────────────────────────────────────
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
-TOP_COINS_LIMIT      = 60   # 60 Coins
-BATCH_SIZE           = 4    # 4 Coins per API call (60/4 = 15 batches)
-MAX_CANDLES          = 300  # Fetch buffer
-
-# ── Timeframes & Candles ─────────────────────────────────────────
-TIMEFRAMES = ["1d", "4h", "1h", "15m"]
-
-CANDLES_1D  = 100
-CANDLES_4H  = 250
-CANDLES_1H  = 200
-CANDLES_15M = 150
-
-CANDLE_COUNTS = {
-    "1d":  CANDLES_1D,
-    "4h":  CANDLES_4H,
-    "1h":  CANDLES_1H,
-    "15m": CANDLES_15M,
+TOP_COINS_LIMIT      = 60
+# Exclude only stablecoin / wrapped pairs (not a real "blacklist")
+BLACKLIST_SYMBOLS = {
+    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT",
+    "DAIUSDT", "USDPUSDT", "EURUSDT",
 }
 
-# ── Scan Settings ────────────────────────────────────────────────
+# ── Timeframes & candle limits ───────────────────────────────────
+TIMEFRAMES    = ["1d", "4h", "1h", "15m"]
+CANDLE_LIMITS = {"1d": 100, "4h": 200, "1h": 150, "15m": 100}
+OHLCV_FETCH_LIMIT = 200          # weight=2, covers all TFs
+
+# ── Scan ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MIN = 15
 
-# ── Trade Management ─────────────────────────────────────────────
-MAX_ACTIVE_TRADES    = 20
-MONITOR_INTERVAL_SEC = 5
+# ── Strategy / SMC ───────────────────────────────────────────────
+SWING_LENGTH        = 20
+LIQUIDITY_RANGE_PCT = 0.01
+POC_BINS            = 50
+EQ_LEVEL_TOLERANCE  = 0.001      # 0.1% for equal highs/lows
+
+# ── Execution window (Sri Lanka Time, UTC+5:30) ──────────────────
+SLST_START      = dt_time(11, 0)
+SLST_END        = dt_time(23, 0)
+SLST_UTC_OFFSET = 5.5
+
+# ── Trading days ─────────────────────────────────────────────────
+OFF_WEEKDAYS = {4, 5, 6}         # Fri, Sat, Sun
+DAY_NAMES    = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# ── Trade monitoring ─────────────────────────────────────────────
+MONITOR_INTERVAL_SEC = 15
 ACTIVE_TRADES_FILE   = "active_trades.json"
 CLOSED_TRADES_FILE   = "closed_trades.json"
 
-# ── Execution Window (09:30 AM - 05:00 PM SLST) ──────────────────
-SLST_START       = dt_time(10, 0)
-SLST_END         = dt_time(17, 0)
-SLST_UTC_OFFSET  = 5.5
-
-# ── Trading Days ─────────────────────────────────────────────────
-TRADING_WEEKDAYS = {0, 1, 2, 3, 4}
-OFF_WEEKDAYS     = {5, 6}
-DAY_NAMES        = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
+# ── Paths ────────────────────────────────────────────────────────
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
