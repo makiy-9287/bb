@@ -1,6 +1,6 @@
 """
 v6 ULTRA orchestrator.
-60 coins → 15 groups of 4 → 15 parallel Nemotron agents → best signal.
+60 coins → split exactly into groups of 4 → 15 parallel Nemotron agents.
 """
 import asyncio
 import logging
@@ -70,20 +70,31 @@ def _fmt(s: float) -> str:
 
 
 def _split_groups(all_data):
-    n = len(OPENROUTER_API_KEYS)
-    if n == 0:
+    n_keys = len(OPENROUTER_API_KEYS)
+    if n_keys == 0:
         return []
-    chunk = (len(all_data) + n - 1) // n
+
+    GROUP_SIZE = 4
     groups = []
-    for i in range(n):
-        part = all_data[i * chunk:(i + 1) * chunk]
+    gid = 1
+    
+    for i in range(0, len(all_data), GROUP_SIZE):
+        part = all_data[i:i + GROUP_SIZE]
         if not part:
             continue
         groups.append({
-            "id": i + 1,
+            "id": gid,
             "symbols": [x["symbol"] for x in part],
             "payload": build_payload(part),
         })
+        gid += 1
+
+    logger.info("Split %d coins into %d groups of %d", len(all_data), len(groups), GROUP_SIZE)
+    
+    if len(groups) > n_keys:
+        logger.warning("Have %d groups but only %d API keys. Extra %d groups will be skipped.", 
+                       len(groups), n_keys, len(groups) - n_keys)
+    
     return groups
 
 
@@ -109,10 +120,6 @@ async def signal_cycle():
     if not groups:
         logger.error("No OpenRouter keys configured — cannot analyse")
         return
-
-    logger.info("Split %d coins into %d groups (%.1f per group)",
-                len(all_data), len(groups),
-                len(all_data) / len(groups))
 
     best = await run_agent_batch(groups)
 
@@ -172,8 +179,8 @@ async def main():
                 REASONING_EFFORT, len(OPENROUTER_API_KEYS))
     logger.info("Timeframes: 1D(100) + 4H(200) + 1H(150) + 15m(100)")
     logger.info("Coins: %d (blacklist excluded)", TOP_COINS_LIMIT)
-    logger.info("Groups: %d × ~4 coins per key",
-                max(1, len(OPENROUTER_API_KEYS)))
+    logger.info("Groups: %d coins per key",
+                max(1, 4))
     logger.info("Scan: every %d min | Mon–Thu", SCAN_INTERVAL_MIN)
     logger.info("Window: %s – %s SLST",
                 SLST_START.strftime("%H:%M"), SLST_END.strftime("%H:%M"))
