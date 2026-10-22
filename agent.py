@@ -1,11 +1,7 @@
 """
 OpenRouter agent pool — 15 parallel Nemotron 3 Ultra calls.
-Fixed:
-- Added required OpenRouter headers (HTTP-Referer, X-Title)
-- Added robust 429 Rate Limit handling with exponential backoff
-- Added validation for 401 Unauthorized keys (logs exact key index)
-- Improved group splitting (exactly 4 coins per group when possible)
-- Improved streaming tool call handling
+Fixed: Removed streaming (which caused OpenRouter 502 drops).
+Added: Global concurrency limit, robust non-streaming call.
 """
 import asyncio
 import json
@@ -19,7 +15,7 @@ from openai import AsyncOpenAI
 
 from config import (
     OPENROUTER_API_KEYS, OPENROUTER_BASE_URL, OPENROUTER_MODEL,
-    REASONING_EFFORT, TOP_COINS_LIMIT
+    REASONING_EFFORT,
 )
 from telegram_sender import send_signal
 
@@ -27,8 +23,7 @@ logger = logging.getLogger(__name__)
 
 _CLIENTS: List[AsyncOpenAI] = []
 _API_TIMEOUT = 180
-_RETRIES     = 3
-_MAX_CONCURRENT = 5  # Increased slightly for better throughput
+_MAX_CONCURRENT = 2  # OpenRouter free tier is strict. 2 at a time is safe.
 
 
 def _get_clients() -> List[AsyncOpenAI]:
@@ -38,11 +33,11 @@ def _get_clients() -> List[AsyncOpenAI]:
             AsyncOpenAI(
                 api_key=k,
                 base_url=OPENROUTER_BASE_URL,
-                # OpenRouter REQUIRES these headers for attribution and to avoid 401
                 default_headers={
                     "HTTP-Referer": "https://github.com/yourusername/ai-trading-agent",
                     "X-Title": "AI Trading Agent v6 Ultra",
-                }
+                },
+                max_retries=0,  # We handle retries manually
             )
             for k in OPENROUTER_API_KEYS
         ]
@@ -119,7 +114,6 @@ vah/val    = value area
 oteL/oteS  = optimal trade entry zones
 sh2/sl2    = second-to-last swings"""
 
-
 TOOLS = [{
     "type": "function",
     "function": {
@@ -165,119 +159,74 @@ def _save_reasoning(tag: str, reasoning: str):
         logger.warning("Could not save reasoning: %s", e)
 
 
-async def _stream_chat(client, messages) -> tuple:
-    """Stream a completion with proper reasoning and tool call handling."""
-    stream = await client.chat.completions.create(
-        model=OPENROUTER_MODEL,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-        max_tokens=16000,
-        stream=True,
-        # OpenRouter requires reasoning to be passed inside extra_body
-        extra_body={
-            "reasoning": {
-                "effort": REASONING_EFFORT,
-                "enabled": True
-            }
-        },
-    )
-
-    content_parts, reasoning_parts = [], []
-    tool_calls: Dict[int, Dict[str, str]] = {}
-
-    async for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if delta is None:
-            continue
-
-        if delta.content:
-            content_parts.append(delta.content)
-
-        # OpenRouter sends reasoning in delta.reasoning or delta.model_extra
-        r = getattr(delta, "reasoning", None)
-        if r is None and getattr(delta, "model_extra", None):
-            r = delta.model_extra.get("reasoning")
-        if r:
-            reasoning_parts.append(r)
-
-        if delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index if tc.index is not None else 0
-                if idx not in tool_calls:
-                    tool_calls[idx] = {"name": "", "arguments": ""}
-                if tc.function:
-                    if tc.function.name:
-                        tool_calls[idx]["name"] += tc.function.name
-                    if tc.function.arguments:
-                        tool_calls[idx]["arguments"] += tc.function.arguments
-
-    return ("".join(content_parts), "".join(reasoning_parts), tool_calls)
-
-
 async def _analyze_group(client, key_idx: int, group_id: int, symbols: List[str], payload: str) -> Optional[Dict[str, Any]]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"Group {group_id} — analyse these {len(symbols)} coins:\n{payload}"},
     ]
 
-    for attempt in range(_RETRIES):
-        try:
-            content, reasoning, tool_calls = await asyncio.wait_for(
-                _stream_chat(client, messages), timeout=_API_TIMEOUT,
-            )
-            break
-        except Exception as exc:
-            # 1. Handle 401 Unauthorized (Bad Key)
-            if hasattr(exc, "status_code") and exc.status_code == 401:
-                logger.error("❌ Group %d: API Key %d is INVALID (401). Skipping.", group_id, key_idx)
-                return None
-                
-            # 2. Handle 429 Rate Limit (OpenRouter free tier limits)
-            if hasattr(exc, "status_code") and exc.status_code == 429:
-                wait = (2 ** attempt) * 3 + random.uniform(1, 3)
-                logger.warning("⏳ Group %d: Rate limited (429). Retry %d/%d in %.1fs...", group_id, attempt+1, _RETRIES, wait)
-                await asyncio.sleep(wait)
-                continue
+    try:
+        # REMOVED stream=True. Non-streaming is much more stable on OpenRouter.
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                max_tokens=8000, # 16k is too high for free tier, causes 502.
+                extra_body={
+                    "reasoning": {
+                        "effort": REASONING_EFFORT,
+                        "enabled": True
+                    }
+                },
+            ),
+            timeout=_API_TIMEOUT
+        )
+    except Exception as exc:
+        if hasattr(exc, "status_code") and exc.status_code == 401:
+            logger.error("❌ Group %d: API Key %d is INVALID (401). Skipping.", group_id, key_idx)
+            return None
+        if hasattr(exc, "status_code") and exc.status_code == 429:
+            logger.warning("⏳ Group %d: Rate limited (429).", group_id)
+            return None
+        
+        logger.error("Group %d failed: %s", group_id, exc)
+        return None
 
-            # 3. Handle other errors
-            if attempt == _RETRIES - 1:
-                logger.error("Group %d failed after %d attempts: %s", group_id, _RETRIES, exc)
-                return None
-            
-            wait = 2 ** attempt
-            logger.warning("Group %d error (attempt %d): %s — retry %ds", group_id, attempt + 1, exc, wait)
-            await asyncio.sleep(wait)
+    msg = response.choices[0].message
+    
+    # OpenRouter sometimes returns reasoning in model_extra or directly
+    reasoning = getattr(msg, "reasoning_content", None)
+    if not reasoning and getattr(msg, "model_extra", None):
+        reasoning = msg.model_extra.get("reasoning")
 
     if reasoning:
-        logger.info("🧠 Group %d reasoning (%d chars): %s …", group_id, len(reasoning), reasoning[:300].replace("\n", " "))
+        logger.info("🧠 Group %d reasoning (%d chars): %s …", 
+                    group_id, len(reasoning), reasoning[:300].replace("\n", " "))
         _save_reasoning(f"group{group_id}", reasoning)
 
-    if not tool_calls:
-        content = (content or "").strip()
+    if not msg.tool_calls:
+        content = (msg.content or "").strip()
         if content:
             logger.info("Group %d reply: %s", group_id, content[:150])
         else:
             logger.info("Group %d → NO_SETUP", group_id)
         return None
 
-    for idx, tc in tool_calls.items():
-        if tc["name"] != "send_trade_signal":
-            continue
-        args_str = tc["arguments"].strip()
-        if not args_str:
+    for tc in msg.tool_calls:
+        if tc.function.name != "send_trade_signal":
             continue
         try:
-            args = json.loads(args_str)
+            args = json.loads(tc.function.arguments)
         except json.JSONDecodeError:
             continue
 
         args["_group_id"] = group_id
         logger.info("🚀 Group %d signal: %s %s (%s, conf=%s, RR=%.2f)",
                     group_id, args.get("direction"), args.get("symbol"),
-                    args.get("entry_type"), args.get("confidence"), args.get("rr_ratio", 0))
+                    args.get("entry_type"), args.get("confidence"),
+                    args.get("rr_ratio", 0))
         return args
 
     return None
@@ -292,7 +241,7 @@ def _rank_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             by_symbol[sym] = s
         else:
             cur = by_symbol[sym]
-            if (conf_score.get(s["confidence"], 0) > conf_score.get(cur["confidence"], 0)):
+            if conf_score.get(s["confidence"], 0) > conf_score.get(cur["confidence"], 0):
                 by_symbol[sym] = s
 
     return sorted(
@@ -303,20 +252,20 @@ def _rank_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 async def run_agent_batch(groups: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Run groups in parallel with throttling to avoid 429s."""
     clients = _get_clients()
     if not clients:
         return None
 
     n = min(len(clients), len(groups))
+    # Strict Semaphore to prevent Rate Limits (429)
     sem = asyncio.Semaphore(_MAX_CONCURRENT)
 
     async def _throttled_task(idx: int):
-        # Stagger launch times to avoid burst rate limits
-        await asyncio.sleep(idx * 1.5) 
+        # Stagger by 2 seconds to prevent connection burst
+        await asyncio.sleep(idx * 2.0)
         async with sem:
             return await _analyze_group(
-                clients[idx], idx + 1, groups[idx]["id"], 
+                clients[idx], idx + 1, groups[idx]["id"],
                 groups[idx]["symbols"], groups[idx]["payload"]
             )
 
@@ -344,4 +293,4 @@ async def run_agent_batch(groups: List[Dict[str, Any]]) -> Optional[Dict[str, An
 
     if await send_signal(best):
         return best
-    return None                    
+    return None
