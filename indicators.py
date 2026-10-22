@@ -1,7 +1,7 @@
 """
 Enhanced SMC/ICT indicators.
-Adds: equal highs/lows, recent sweep (last 5 candles), POC zone,
-plus all previous OB/FVG/BOS/CHoCH/liquidity/S-R fields.
+Fixed: pandas_ta_classic ATR crash — replaced with manual ATR.
+Fixed: NaN/dtype sanitization before all computations.
 """
 import logging
 from typing import Any, Dict, List
@@ -41,6 +41,25 @@ def _last(series):
         return None
 
 
+def _manual_atr(high: pd.Series, low: pd.Series,
+                close: pd.Series, length: int = 14) -> float | None:
+    """Manual ATR to bypass pandas_ta_classic's concat crash."""
+    try:
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=length, min_periods=length).mean()
+        val = atr.iloc[-1]
+        if pd.isna(val):
+            return None
+        return float(val)
+    except Exception as exc:
+        logger.debug("Manual ATR failed: %s", exc)
+        return None
+
+
 def _swing_highs_lows(df: pd.DataFrame) -> pd.DataFrame:
     ohlc = df[["open", "high", "low", "close"]].copy()
     return smc.swing_highs_lows(ohlc, swing_length=SWING_LENGTH)
@@ -76,7 +95,6 @@ def _detect_equal_levels(shl: pd.DataFrame) -> tuple:
         lows  = shl[shl["HighLow"] == -1]["Level"].dropna().tolist()
         eqh = _cluster_levels(highs, EQ_LEVEL_TOLERANCE)
         eql = _cluster_levels(lows, EQ_LEVEL_TOLERANCE)
-        # Sort: highs descending (nearest above), lows ascending (nearest below)
         eqh.sort(key=lambda x: x["p"], reverse=True)
         eql.sort(key=lambda x: x["p"])
         return eqh[:5], eql[:5]
@@ -243,6 +261,13 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     if df.empty or len(df) < 30:
         return {}
 
+    # ── FIX: sanitize before any computation ────────────────────
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = df[col].astype(float)
+    if len(df) < 30:
+        return {}
+
     close, high, low, vol = (df["close"], df["high"],
                               df["low"], df["volume"])
     ohlc = df[["open", "high", "low", "close"]].copy()
@@ -267,7 +292,8 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     else:
         out["ema_trend"] = None
 
-    atr_val = _last(ta.atr(high, low, close, length=14))
+    # ── FIX: manual ATR (bypass pandas_ta_classic crash) ────────
+    atr_val = _manual_atr(high, low, close, length=14)
     out["atr"] = _safe_round(atr_val)
     out["atr_pct"] = (_safe_round(atr_val / close.iloc[-1] * 100, 2)
                       if atr_val and close.iloc[-1] else None)
@@ -286,7 +312,6 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     out["poc_strength"] = (_safe_round(vp[poc_bin] / total_vol * 100, 2)
                            if total_vol > 0 else None)
 
-    # POC zone = bin boundaries + 0.25×ATR buffer
     buf = (atr_val or 0) * 0.25
     poc_low  = price_bins[poc_bin] - buf
     poc_high = price_bins[poc_bin + 1] + buf
