@@ -1,33 +1,35 @@
 """
-Continuous trade monitor with TP1/TP2 partial tracking.
+Trade monitor — limit fills, TP1→TP2→TP3 tracking, no SL move after TP1.
+Uses 1m high/low to catch wicks.
 """
 import asyncio
 import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
 from config import (
     BINANCE_FUTURES_REST, MONITOR_INTERVAL_SEC,
-    ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE, MAX_ACTIVE_TRADES,
+    ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE,
 )
 from telegram_sender import send_raw_message
 
 logger = logging.getLogger(__name__)
-_lock: Optional[asyncio.Lock] = None
+
+_trades_lock: Optional[asyncio.Lock] = None
 
 
 def _get_lock() -> asyncio.Lock:
-    global _lock
-    if _lock is None:
-        _lock = asyncio.Lock()
-    return _lock
+    global _trades_lock
+    if _trades_lock is None:
+        _trades_lock = asyncio.Lock()
+    return _trades_lock
 
 
-def _load_json(path: str) -> List[Dict[str, Any]]:
+def _load(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
     try:
@@ -39,31 +41,37 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _save_json(path: str, data: List[Dict[str, Any]]):
+def _save(path: str, data: List[Dict[str, Any]]):
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
     os.replace(tmp, path)
 
 
+# ── accessors ────────────────────────────────────────────────────
+def get_pending_trades() -> List[Dict[str, Any]]:
+    return [t for t in _load(ACTIVE_TRADES_FILE)
+            if t.get("status") == "pending"]
+
+
 def get_active_trades() -> List[Dict[str, Any]]:
-    return [t for t in _load_json(ACTIVE_TRADES_FILE)
-            if t.get("status") == "open"]
+    return [t for t in _load(ACTIVE_TRADES_FILE)
+            if t.get("status") in ("open", "tp1_hit", "tp2_hit")]
 
 
 def get_closed_trades() -> List[Dict[str, Any]]:
-    return _load_json(CLOSED_TRADES_FILE)
+    return _load(CLOSED_TRADES_FILE)
 
 
-def calc_pnl(trade: Dict[str, Any], current_price: float) -> Dict[str, float]:
-    entry = float(trade["entry"])
-    if entry == 0:
-        return {"pnl_pct": 0.0, "direction": trade["direction"]}
+def calc_pnl(trade: Dict[str, Any], price: float) -> Dict[str, float]:
+    e = float(trade["entry"])
+    if e == 0:
+        return {"pnl_pct": 0.0}
     if trade["direction"].upper() == "LONG":
-        pct = (current_price - entry) / entry * 100
+        pct = (price - e) / e * 100
     else:
-        pct = (entry - current_price) / entry * 100
-    return {"pnl_pct": pct, "direction": trade["direction"]}
+        pct = (e - price) / e * 100
+    return {"pnl_pct": pct}
 
 
 async def get_prices(symbols: List[str]) -> Dict[str, float]:
@@ -71,86 +79,55 @@ async def get_prices(symbols: List[str]) -> Dict[str, float]:
         return {}
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/price"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as resp:
-            data = await resp.json()
+        async with session.get(url, timeout=10) as r:
+            data = await r.json()
     pm = {i["symbol"]: float(i["price"]) for i in data}
     return {s: pm[s] for s in symbols if s in pm}
 
 
+async def _get_1m_hl(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """Fetch last 2×1m candles — returns max high / min low / last close."""
+    out: Dict[str, Dict[str, float]] = {}
+    if not symbols:
+        return out
+    url = f"{BINANCE_FUTURES_REST}/fapi/v1/klines"
+    async with aiohttp.ClientSession() as session:
+        for sym in symbols:
+            try:
+                params = {"symbol": sym, "interval": "1m", "limit": 2}
+                async with session.get(url, params=params, timeout=5) as r:
+                    k = await r.json()
+                if isinstance(k, list) and k:
+                    out[sym] = {
+                        "high": max(float(x[2]) for x in k),
+                        "low":  min(float(x[3]) for x in k),
+                        "close": float(k[-1][4]),
+                    }
+            except Exception:
+                continue
+    return out
+
+
+def _key(t: Dict[str, Any]) -> str:
+    return f"{t.get('symbol','?')}|{t.get('opened_at','')}"
+
+
 def _append_closed(trade: Dict[str, Any]):
-    closed = _load_json(CLOSED_TRADES_FILE)
+    closed = _load(CLOSED_TRADES_FILE)
     closed.append(trade)
-    _save_json(CLOSED_TRADES_FILE, closed)
+    _save(CLOSED_TRADES_FILE, closed)
 
 
-async def add_trade(signal: Dict[str, Any]) -> bool:
+async def add_trade(signal: Dict[str, Any]):
     async with _get_lock():
-        trades = _load_json(ACTIVE_TRADES_FILE)
-        open_trades = [t for t in trades if t.get("status") == "open"]
-
-        if len(open_trades) >= MAX_ACTIVE_TRADES:
-            logger.warning("Max concurrent positions (%d) — skip %s",
-                           MAX_ACTIVE_TRADES, signal["symbol"])
-            return False
-
+        trades = _load(ACTIVE_TRADES_FILE)
         t = dict(signal)
         t["opened_at"] = datetime.utcnow().isoformat()
-        t["status"]    = "open"
-        t["tp1_hit"]   = False
-        t["tp2_hit"]   = False
-        t["tp3_hit"]   = False
+        t["status"] = "pending" if t.get("entry_type") == "LIMIT" else "open"
+        t["tp_hits"] = []
         trades.append(t)
-        _save_json(ACTIVE_TRADES_FILE, trades)
-    logger.info("Trade added: %s", signal["symbol"])
-    return True
-
-
-def _detect_action(trade: Dict[str, Any], price: float) -> Optional[str]:
-    d = trade["direction"].upper()
-    sl  = float(trade["sl"])
-    tp1 = float(trade["tp1"])
-    tp2 = float(trade["tp2"])
-    tp3 = float(trade["tp3"])
-    tp1_hit = bool(trade.get("tp1_hit"))
-    tp2_hit = bool(trade.get("tp2_hit"))
-
-    if d == "LONG":
-        if price <= sl:
-            return "SL"
-        if not tp2_hit and price >= tp3:
-            return "TP3"
-        if not tp2_hit and price >= tp2:
-            return "TP2"
-        if not tp1_hit and price >= tp1:
-            return "TP1"
-    else:
-        if price >= sl:
-            return "SL"
-        if not tp2_hit and price <= tp3:
-            return "TP3"
-        if not tp2_hit and price <= tp2:
-            return "TP2"
-        if not tp1_hit and price <= tp1:
-            return "TP1"
-    return None
-
-
-def _cascade_tp_flags(t: Dict[str, Any], action: str):
-    if action == "TP2":
-        t["tp1_hit"] = True
-        t["tp2_hit"] = True
-    elif action == "TP3":
-        t["tp1_hit"] = True
-        t["tp2_hit"] = True
-        t["tp3_hit"] = True
-
-
-def _sl_context(t: Dict[str, Any]) -> str:
-    if t.get("tp2_hit"):
-        return " (trailed to TP1)"
-    if t.get("tp1_hit"):
-        return " (breakeven)"
-    return ""
+        _save(ACTIVE_TRADES_FILE, trades)
+    logger.info("Trade added: %s (%s)", signal["symbol"], t["status"])
 
 
 async def monitor_loop():
@@ -158,103 +135,151 @@ async def monitor_loop():
 
     while True:
         try:
-            trades = _load_json(ACTIVE_TRADES_FILE)
-            open_trades = [t for t in trades if t.get("status") == "open"]
-            if not open_trades:
+            trades = _load(ACTIVE_TRADES_FILE)
+            pending = [t for t in trades if t.get("status") == "pending"]
+            active = [t for t in trades
+                      if t.get("status") in ("open", "tp1_hit", "tp2_hit")]
+
+            if not pending and not active:
                 await asyncio.sleep(MONITOR_INTERVAL_SEC)
                 continue
 
-            symbols = list({t["symbol"] for t in open_trades})
-            try:
-                prices = await get_prices(symbols)
-            except Exception as exc:
-                logger.warning("Price fetch failed: %s", exc)
-                await asyncio.sleep(MONITOR_INTERVAL_SEC)
-                continue
+            symbols = list({t["symbol"] for t in pending + active})
+            data = await _get_1m_hl(symbols)
 
-            notifications: List[Tuple[Dict[str, Any], str, float]] = []
+            fills: List[tuple] = []
+            closures: List[tuple] = []
+            tps: List[tuple] = []
 
             async with _get_lock():
-                current = _load_json(ACTIVE_TRADES_FILE)
-                updated: List[Dict[str, Any]] = []
+                current = _load(ACTIVE_TRADES_FILE)
+                remaining: List[Dict[str, Any]] = []
 
                 for t in current:
-                    if t.get("status") != "open":
-                        updated.append(t)
-                        continue
-
+                    st = t.get("status")
                     sym = t["symbol"]
-                    price = prices.get(sym)
-                    if price is None:
-                        updated.append(t)
+                    d = t["direction"].upper()
+                    pd = data.get(sym)
+
+                    if st == "pending":
+                        # Check limit fill
+                        if pd is None:
+                            remaining.append(t)
+                            continue
+                        filled = (
+                            (d == "LONG" and pd["low"] <= float(t["entry"]))
+                            or (d == "SHORT" and pd["high"] >= float(t["entry"]))
+                        )
+                        if filled:
+                            t["status"] = "open"
+                            t["filled_at"] = datetime.utcnow().isoformat()
+                            fills.append((sym, d, float(t["entry"])))
+                        remaining.append(t)
                         continue
 
-                    action = _detect_action(t, price)
-                    if action is None:
-                        updated.append(t)
+                    if st in ("open", "tp1_hit", "tp2_hit"):
+                        if pd is None:
+                            remaining.append(t)
+                            continue
+
+                        entry = float(t["entry"])
+                        sl = float(t["sl"])
+                        tp1, tp2, tp3 = (float(t["tp1"]), float(t["tp2"]),
+                                         float(t["tp3"]))
+
+                        # SL check (original SL, no move after TP1)
+                        sl_hit = (
+                            (d == "LONG" and pd["low"] <= sl)
+                            or (d == "SHORT" and pd["high"] >= sl)
+                        )
+                        if sl_hit:
+                            t["status"] = "closed"
+                            t["closed_at"] = datetime.utcnow().isoformat()
+                            t["exit_price"] = sl
+                            t["exit_reason"] = "SL"
+                            t["pnl_pct"] = round(
+                                calc_pnl(t, sl)["pnl_pct"], 4)
+                            _append_closed(t)
+                            closures.append((sym, "SL", sl,
+                                             t["pnl_pct"]))
+                            continue
+
+                        # TP progression
+                        if d == "LONG":
+                            if st == "open" and pd["high"] >= tp1:
+                                t["status"] = "tp1_hit"
+                                t["tp_hits"].append("TP1")
+                                tps.append((sym, "TP1", tp1))
+                            elif st == "tp1_hit" and pd["high"] >= tp2:
+                                t["status"] = "tp2_hit"
+                                t["tp_hits"].append("TP2")
+                                tps.append((sym, "TP2", tp2))
+                            elif st == "tp2_hit" and pd["high"] >= tp3:
+                                t["status"] = "closed"
+                                t["closed_at"] = datetime.utcnow().isoformat()
+                                t["exit_price"] = tp3
+                                t["exit_reason"] = "TP3"
+                                t["pnl_pct"] = round(
+                                    calc_pnl(t, tp3)["pnl_pct"], 4)
+                                _append_closed(t)
+                                closures.append((sym, "TP3", tp3,
+                                                 t["pnl_pct"]))
+                                continue
+                        else:  # SHORT
+                            if st == "open" and pd["low"] <= tp1:
+                                t["status"] = "tp1_hit"
+                                t["tp_hits"].append("TP1")
+                                tps.append((sym, "TP1", tp1))
+                            elif st == "tp1_hit" and pd["low"] <= tp2:
+                                t["status"] = "tp2_hit"
+                                t["tp_hits"].append("TP2")
+                                tps.append((sym, "TP2", tp2))
+                            elif st == "tp2_hit" and pd["low"] <= tp3:
+                                t["status"] = "closed"
+                                t["closed_at"] = datetime.utcnow().isoformat()
+                                t["exit_price"] = tp3
+                                t["exit_reason"] = "TP3"
+                                t["pnl_pct"] = round(
+                                    calc_pnl(t, tp3)["pnl_pct"], 4)
+                                _append_closed(t)
+                                closures.append((sym, "TP3", tp3,
+                                                 t["pnl_pct"]))
+                                continue
+
+                        remaining.append(t)
                         continue
 
-                    if action == "TP1":
-                        t["tp1_hit"] = True
-                        t["sl"] = t["entry"]
-                        updated.append(t)
-                        notifications.append((t, "TP1", price))
-                    elif action == "TP2":
-                        _cascade_tp_flags(t, "TP2")
-                        t["sl"] = t["tp1"]
-                        updated.append(t)
-                        notifications.append((t, "TP2", price))
-                    else:
-                        if action == "TP3":
-                            _cascade_tp_flags(t, "TP3")
-                        t["status"]      = "closed"
-                        t["closed_at"]   = datetime.utcnow().isoformat()
-                        t["exit_price"]  = price
-                        t["exit_reason"] = action
-                        pnl = calc_pnl(t, price)
-                        t["pnl_pct"] = round(pnl["pnl_pct"], 4)
-                        _append_closed(t)
-                        notifications.append((t, action, price))
+                    remaining.append(t)
 
-                _save_json(ACTIVE_TRADES_FILE, updated)
+                _save(ACTIVE_TRADES_FILE, remaining)
 
-            for t, action, price in notifications:
-                sym = t["symbol"]
-                d = t["direction"].upper()
+            # Notifications outside lock
+            for sym, d, px in fills:
+                await send_raw_message(
+                    f"✅ *Entry Filled* — `{sym}`\n"
+                    f"Direction: {d}\n"
+                    f"Fill: `{px}`"
+                )
+                logger.info("Limit filled: %s %s @ %s", sym, d, px)
 
-                if action in ("TP1", "TP2"):
-                    pnl_now = calc_pnl(t, price)["pnl_pct"]
-                    extra = ("SL → breakeven" if action == "TP1"
-                             else "SL → TP1")
-                    await send_raw_message(
-                        f"🎯 *{action} Hit* — `{sym}` {d}\n"
-                        f"Price: `{price}` | PnL: `{pnl_now:+.2f}%`\n"
-                        f"_{extra}_ — still tracking TP3"
-                    )
-                    logger.info("%s hit %s @ %s", sym, action, price)
-                else:
-                    if action == "SL":
-                        emoji = "❌"
-                        reason_str = f"SL{_sl_context(t)}"
-                    else:
-                        emoji = "✅"
-                        reason_str = "TP3"
+            for sym, tp, px in tps:
+                await send_raw_message(
+                    f"🎯 *{tp} Hit* — `{sym}`\n"
+                    f"Price: `{px}`"
+                )
+                logger.info("%s hit: %s @ %s", tp, sym, px)
 
-                    tps = []
-                    if t.get("tp1_hit"): tps.append("TP1")
-                    if t.get("tp2_hit"): tps.append("TP2")
-                    tps_str = (f" _{'+'.join(tps)} hit before_"
-                               if tps else "")
-                    pnl_pct = t.get("pnl_pct", 0.0)
-                    await send_raw_message(
-                        f"{emoji} *Trade Closed* — `{sym}` {d}\n"
-                        f"Reason: *{reason_str}* at `{price}`{tps_str}\n"
-                        f"PnL: `{pnl_pct:+.2f}%`"
-                    )
-                    logger.info("Trade closed: %s %s @ %s (%.2f%%)",
-                                sym, reason_str, price, pnl_pct)
+            for sym, reason, px, pnl in closures:
+                emoji = "✅" if reason.startswith("TP") else "❌"
+                await send_raw_message(
+                    f"{emoji} *Trade Closed* — `{sym}`\n"
+                    f"Reason: *{reason}* at `{px}`\n"
+                    f"PnL: `{pnl:+.2f}%`"
+                )
+                logger.info("Trade closed: %s %s @ %s (%.2f%%)",
+                            sym, reason, px, pnl)
 
         except Exception as exc:
-            logger.error("Monitor loop error: %s", exc, exc_info=True)
+            logger.error("Monitor error: %s", exc, exc_info=True)
 
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
