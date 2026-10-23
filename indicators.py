@@ -372,9 +372,25 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         out["bos"]   = int(bv.iloc[-1]) if not bv.empty else 0
         out["choch"] = int(cv.iloc[-1]) if not cv.empty else 0
         out["bos_level"] = _safe_round(lv.iloc[-1]) if not lv.empty else None
+        # which event is the LATEST (bos / choch alone are ambiguous)
+        out["last_struct"] = None
+        try:
+            ev = bc[bc["BOS"].notna() | bc["CHOCH"].notna()]
+            if not ev.empty:
+                bi = ev["BrokenIndex"].fillna(0).values if "BrokenIndex" in ev else np.zeros(len(ev))
+                k = int(np.argmax(bi))
+                row = ev.iloc[k]
+                kind = "CHOCH" if pd.notna(row["CHOCH"]) else "BOS"
+                out["last_struct"] = {
+                    "t": kind, "d": int(row[kind]),
+                    "ago": int(len(bc) - 1 - bi[k]) if bi[k] > 0 else None,
+                }
+        except Exception:
+            out["last_struct"] = None
     except Exception:
         out["bos"] = out["choch"] = 0
         out["bos_level"] = None
+        out["last_struct"] = None
 
     # ── Order Blocks ────────────────────────────────────────────
     ob_df = None
@@ -448,6 +464,8 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         if not lv.empty:
             for i in range(len(lv)):
                 x = _safe_round(lv["Level"].iloc[i])
+                if x is None:
+                    continue
                 allv.append(x)
                 (bs if x > cp else ss).append(x)
         out["liquidity_levels"] = allv[-3:] if allv else []

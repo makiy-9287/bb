@@ -170,8 +170,8 @@ async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = "🟡"
         lines.append(
             f"{emoji} `{t['symbol']}` *{d}* LIMIT @ `{float(t['entry']):.6g}`\n"
-            f"   Zone: `{float(t.get('zone_low', 0)):.6g}` – "
-            f"`{float(t.get('zone_high', 0)):.6g}`"
+            f"   Zone: `{float(t.get('zone_low') or 0):.6g}` – "
+            f"`{float(t.get('zone_high') or 0):.6g}`"
         )
 
     for t in active:

@@ -24,8 +24,12 @@ _RETRIES     = 3
 async def get_top_volume_symbols(limit: int = TOP_COINS_LIMIT) -> List[str]:
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/24hr"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=15) as resp:
-            data = await resp.json()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json(content_type=None)
+
+    if not isinstance(data, list):
+        # e.g. geo-block / rate-limit returns a dict like {"code":..,"msg":..}
+        raise RuntimeError(f"Binance ticker error: {str(data)[:200]}")
 
     usdt_perps = [
         t for t in data
@@ -69,6 +73,11 @@ async def fetch_all_data(
         "options": {"defaultType": "future"},
     })
     sem = asyncio.Semaphore(_CONCURRENCY)
+    try:
+        await exchange.load_markets()   # load once, avoid 240 tasks racing to load
+    except Exception as exc:
+        await exchange.close()
+        raise RuntimeError(f"load_markets failed: {exc}") from exc
 
     async def _task(sym: str, tf: str):
         async with sem:
@@ -76,7 +85,10 @@ async def fetch_all_data(
             return sym, tf, df
 
     tasks = [_task(s, tf) for s in symbols for tf in TIMEFRAMES]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await exchange.close()      # always close, even on error
 
     bundle: Dict[str, Dict[str, pd.DataFrame]] = {}
     for r in results:
@@ -88,6 +100,5 @@ async def fetch_all_data(
             continue
         bundle.setdefault(sym, {})[tf] = df
 
-    await exchange.close()
     logger.info("Fetched data for %d symbols", len(bundle))
     return bundle

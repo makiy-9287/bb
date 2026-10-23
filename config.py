@@ -67,3 +67,13 @@ CLOSED_TRADES_FILE   = "closed_trades.json"
 # ── Paths ────────────────────────────────────────────────────────
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── A+ signal filter (signal_filter.py) ──────────────────────────
+MIN_RR              = 1.5    # RR measured to TP1 (real numbers, not the model's claim)
+MAX_SL_PCT          = 2.0    # max SL distance from entry, %  (day-trade)
+SL_ATR_BUFFER       = 0.5    # SL = 15m structure anchor ± 0.5 × ATR(15m)
+SL_MIN_ATR          = 0.8    # SL at least 0.8 × ATR(15m) from entry
+MAX_ENTRY_DIST_PCT  = 2.5    # LIMIT entry max distance from current price, %
+MAX_TP1_PCT         = 4.0    # TP1 must be reachable today
+MAX_TP3_PCT         = 10.0
+MIN_SCORE           = 75     # 0-100 quality score; below this → signal is discarded

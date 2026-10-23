@@ -43,13 +43,22 @@ async def _send_to(chat_id: str, text: str) -> bool:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    logger.error("Telegram to %s failed %s: %s",
-                                 chat_id, r.status, body[:200])
-                    return False
-                return True
+            async with session.post(url, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return True
+                body = await r.text()
+                logger.error("Telegram to %s failed %s: %s",
+                             chat_id, r.status, body[:200])
+                if r.status == 400 and "parse" in body.lower():
+                    # Markdown entity error → resend as plain text so signal isn't lost
+                    plain = dict(payload)
+                    plain.pop("parse_mode", None)
+                    plain["text"] = text.replace("`", "").replace("*", "").replace("\\", "")
+                    async with session.post(url, json=plain,
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                        return r2.status == 200
+                return False
     except Exception as exc:
         logger.error("Telegram exception to %s: %s", chat_id, exc)
         return False
@@ -91,7 +100,8 @@ async def send_signal(signal: dict) -> bool:
         f"🎯 TP3:  `{signal.get('tp3', '-')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Confidence: `{signal.get('confidence', '-')}`\n"
-        f"📈 R:R: `{signal.get('rr_ratio', '-')}`\n"
+        f"📈 R:R (TP1): `{signal.get('rr_ratio', '-')}`\n"
+        f"⭐ Score: `{signal.get('score', '-')}/100`\n"
         f"📝 {reason}"
     )
     return await _broadcast(text)

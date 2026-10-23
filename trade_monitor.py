@@ -79,7 +79,7 @@ async def get_prices(symbols: List[str]) -> Dict[str, float]:
         return {}
     url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/price"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             data = await r.json()
     pm = {i["symbol"]: float(i["price"]) for i in data}
     return {s: pm[s] for s in symbols if s in pm}
@@ -95,7 +95,7 @@ async def _get_1m_hl(symbols: List[str]) -> Dict[str, Dict[str, float]]:
         for sym in symbols:
             try:
                 params = {"symbol": sym, "interval": "1m", "limit": 2}
-                async with session.get(url, params=params, timeout=5) as r:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as r:
                     k = await r.json()
                 if isinstance(k, list) and k:
                     out[sym] = {

@@ -35,7 +35,7 @@ _KEY_MAP = {
     "recent_sweep": "swp",
     "sr_levels": "sr", "rsi_div": "rsiDiv", "rv": "rv",
     "last_close": "lc", "last_candle_dir": "lcd",
-    "recent_highs": "rhi", "recent_lows": "rlo",
+    "last_struct": "ls", "recent_highs": "rhi", "recent_lows": "rlo",
 }
 
 

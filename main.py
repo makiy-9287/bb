@@ -86,6 +86,7 @@ def _split_groups(all_data):
             "id": gid,
             "symbols": [x["symbol"] for x in part],
             "payload": build_payload(part),
+            "data": {x["symbol"]: x for x in part},
         })
         gid += 1
 
@@ -105,12 +106,18 @@ async def signal_cycle():
     bundle = await fetch_all_data(symbols)
 
     logger.info("Computing indicators …")
-    all_data = []
-    for sym, tf_data in bundle.items():
-        try:
-            all_data.append(compute_multi_timeframe(sym, tf_data))
-        except Exception as exc:
-            logger.warning("Indicator error %s: %s", sym, exc)
+
+    def _compute_all():
+        out = []
+        for sym, tf_data in bundle.items():
+            try:
+                out.append(compute_multi_timeframe(sym, tf_data))
+            except Exception as exc:
+                logger.warning("Indicator error %s: %s", sym, exc)
+        return out
+
+    # CPU-heavy → run in a thread so trade monitor / telegram bot keep running
+    all_data = await asyncio.to_thread(_compute_all)
 
     if not all_data:
         logger.warning("No data — skipping")
