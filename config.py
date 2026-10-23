@@ -51,12 +51,12 @@ POC_BINS            = 50
 EQ_LEVEL_TOLERANCE  = 0.001      # 0.1% for equal highs/lows
 
 # ── Execution window (Sri Lanka Time, UTC+5:30) ──────────────────
-SLST_START      = dt_time(11, 0)
-SLST_END        = dt_time(23, 0)
+SLST_START      = dt_time(8, 0)
+SLST_END        = dt_time(20, 0)
 SLST_UTC_OFFSET = 5.5
 
 # ── Trading days ─────────────────────────────────────────────────
-OFF_WEEKDAYS = {4, 5, 6}         # Fri, Sat, Sun
+OFF_WEEKDAYS = {5, 6}         # Fri, Sat, Sun
 DAY_NAMES    = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Trade monitoring ─────────────────────────────────────────────
