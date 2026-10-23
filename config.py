@@ -56,7 +56,7 @@ SLST_END        = dt_time(20, 0)
 SLST_UTC_OFFSET = 5.5
 
 # ── Trading days ─────────────────────────────────────────────────
-OFF_WEEKDAYS = {5, 6}         # Fri, Sat, Sun
+OFF_WEEKDAYS = {0, 4, 5, 6}         # Fri, Sat, Sun
 DAY_NAMES    = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Trade monitoring ─────────────────────────────────────────────
@@ -71,8 +71,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ── A+ signal filter (signal_filter.py) ──────────────────────────
 MIN_RR              = 1.5    # RR measured to TP1 (real numbers, not the model's claim)
 MAX_SL_PCT          = 2.0    # max SL distance from entry, %  (day-trade)
-SL_ATR_BUFFER       = 0.5    # SL = 15m structure anchor ± 0.5 × ATR(15m)
-SL_MIN_ATR          = 0.8    # SL at least 0.8 × ATR(15m) from entry
+SL_ATR_BUFFER       = 1.5    # SL = 15m structure anchor ± 0.5 × ATR(15m)
+SL_MIN_ATR          = 2.0   # SL at least 0.8 × ATR(15m) from entry
 MAX_ENTRY_DIST_PCT  = 2.5    # LIMIT entry max distance from current price, %
 MAX_TP1_PCT         = 4.0    # TP1 must be reachable today
 MAX_TP3_PCT         = 10.0
