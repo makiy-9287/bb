@@ -51,8 +51,8 @@ POC_BINS            = 50
 EQ_LEVEL_TOLERANCE  = 0.001      # 0.1% for equal highs/lows
 
 # ── Execution window (Sri Lanka Time, UTC+5:30) ──────────────────
-SLST_START      = dt_time(8, 0)
-SLST_END        = dt_time(20, 0)
+SLST_START      = dt_time(12, 0)
+SLST_END        = dt_time(22, 0)
 SLST_UTC_OFFSET = 5.5
 
 # ── Trading days ─────────────────────────────────────────────────
