@@ -76,4 +76,4 @@ SL_MIN_ATR          = 0.8    # SL at least 0.8 × ATR(15m) from entry
 MAX_ENTRY_DIST_PCT  = 2.5    # LIMIT entry max distance from current price, %
 MAX_TP1_PCT         = 4.0    # TP1 must be reachable today
 MAX_TP3_PCT         = 10.0
-MIN_SCORE           = 75     # 0-100 quality score; below this → signal is discarded
+MIN_SCORE           = 83   # 0-100 quality score; below this → signal is discarded
