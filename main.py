@@ -17,7 +17,7 @@ from data_fetcher import get_top_volume_symbols, fetch_all_data
 from indicators import compute_multi_timeframe
 from payload_builder import build_payload
 from agent import run_agent_batch
-from trade_monitor import monitor_loop, add_trade
+from trade_monitor import monitor_loop, add_trade, get_pending_trades, get_active_trades
 from telegram_bot import telegram_bot_loop, update_state, AGENT_STATE
 
 logging.basicConfig(
@@ -102,7 +102,18 @@ def _split_groups(all_data):
 async def signal_cycle():
     logger.info("═══ Signal cycle starting ═══")
 
-    symbols = await get_top_volume_symbols(TOP_COINS_LIMIT)
+    # Coins that already have a pending / open trade are skipped in this scan,
+    # so the same setup is not sent again and again.
+    busy = {t.get("symbol") for t in get_pending_trades() + get_active_trades()}
+    busy.discard(None)
+
+    # fetch extra coins to compensate for the skipped ones → still TOP_COINS_LIMIT coins analysed
+    symbols = await get_top_volume_symbols(TOP_COINS_LIMIT + len(busy))
+    symbols = [s for s in symbols if s not in busy][:TOP_COINS_LIMIT]
+    if busy:
+        logger.info("⏭️ Skipping %d coin(s) with active/pending trade: %s",
+                    len(busy), ", ".join(sorted(busy)))
+
     bundle = await fetch_all_data(symbols)
 
     logger.info("Computing indicators …")
