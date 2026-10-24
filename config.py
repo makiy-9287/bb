@@ -56,7 +56,7 @@ SLST_END        = dt_time(22, 0)
 SLST_UTC_OFFSET = 5.5
 
 # ── Trading days ─────────────────────────────────────────────────
-OFF_WEEKDAYS = {0, 4, 5, 6}         # Fri, Sat, Sun
+OFF_WEEKDAYS = {6}         # Fri, Sat, Sun
 DAY_NAMES    = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # ── Trade monitoring ─────────────────────────────────────────────
