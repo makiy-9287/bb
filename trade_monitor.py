@@ -1,285 +1,269 @@
 """
-Trade monitor — limit fills, TP1→TP2→TP3 tracking, no SL move after TP1.
-Fixed: KeyError on 'tp_hits' for legacy trades.
+Signal tracking (SIMULATED — not exchange fills).
+
+States: pending → open → tp1_hit → tp2_hit → closed   |   pending → closed (EXPIRED / INVALIDATED)
+Rules (all conservative, evaluated on CLOSED 1m candles strictly after signal creation):
+  • candles that opened before the signal are never used (no pre-entry highs/lows);
+  • LIMIT fills when price touches the entry; TP/SL are NOT evaluated on the fill candle except that an SL touch
+    there is booked as an (ambiguous) stop-out;
+  • TP and SL inside the same 1m candle → outcome is AMBIGUOUS and booked as the stop (never the favourable path);
+  • partial exits follow TP_SPLIT; costs/funding/R are computed in performance.py.
 """
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 
-from config import (
-    BINANCE_FUTURES_REST, MONITOR_INTERVAL_SEC,
-    ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE,
-)
+from config import (BINANCE_FUTURES_REST, MONITOR_INTERVAL_SEC, ACTIVE_TRADES_FILE, CLOSED_TRADES_FILE,
+                    TP_SPLIT, SIGNAL_EXPIRY_MIN, MAX_HOLD_HOURS, MOVE_SL_TO_BE_AFTER_TP1)
+from performance import compute_result
 from telegram_sender import send_raw_message
 
 logger = logging.getLogger(__name__)
-
-_trades_lock: Optional[asyncio.Lock] = None
+M1 = 60_000
+_lock: Optional[asyncio.Lock] = None
 
 
 def _get_lock() -> asyncio.Lock:
-    global _trades_lock
-    if _trades_lock is None:
-        _trades_lock = asyncio.Lock()
-    return _trades_lock
+    global _lock
+    if _lock is None:
+        _lock = asyncio.Lock()
+    return _lock
 
 
 def _load(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
     except Exception as exc:
-        logger.warning("Read %s failed: %s", path, exc)
+        logger.error("Could not read %s: %s", path, exc)
         return []
 
 
 def _save(path: str, data: List[Dict[str, Any]]):
-    tmp = f"{path}.tmp"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
     os.replace(tmp, path)
 
 
-# ── accessors ────────────────────────────────────────────────────
 def get_pending_trades() -> List[Dict[str, Any]]:
-    return [t for t in _load(ACTIVE_TRADES_FILE)
-            if t.get("status") == "pending"]
+    return [t for t in _load(ACTIVE_TRADES_FILE) if t.get("status") == "pending"]
 
 
 def get_active_trades() -> List[Dict[str, Any]]:
-    return [t for t in _load(ACTIVE_TRADES_FILE)
-            if t.get("status") in ("open", "tp1_hit", "tp2_hit")]
+    return [t for t in _load(ACTIVE_TRADES_FILE) if t.get("status") in ("open", "tp1_hit", "tp2_hit")]
 
 
 def get_closed_trades() -> List[Dict[str, Any]]:
     return _load(CLOSED_TRADES_FILE)
 
 
+def recently_closed_symbols(minutes: float) -> Set[str]:
+    cut = (time.time() * 1000) - minutes * 60_000
+    return {t["symbol"] for t in _load(CLOSED_TRADES_FILE)
+            if t.get("fill_price") and t.get("closed_ms", 0) >= cut}
+
+
 def calc_pnl(trade: Dict[str, Any], price: float) -> Dict[str, float]:
-    e = float(trade["entry"])
-    if e == 0:
-        return {"pnl_pct": 0.0}
-    if trade["direction"].upper() == "LONG":
-        pct = (price - e) / e * 100
-    else:
-        pct = (e - price) / e * 100
-    return {"pnl_pct": pct}
+    """Unrealised + realised gross PnL % (informational)."""
+    fill = float(trade.get("fill_price") or trade["entry"])
+    d = 1.0 if trade["direction"].upper() == "LONG" else -1.0
+    realised = sum(l["frac"] * d * (l["price"] - fill) / fill for l in trade.get("legs", []))
+    rem = float(trade.get("remaining", 1.0))
+    return {"pnl_pct": (realised + rem * d * (price - fill) / fill) * 100}
 
 
-async def get_prices(symbols: List[str]) -> Dict[str, float]:
-    if not symbols:
-        return {}
-    url = f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/price"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json()
-    pm = {i["symbol"]: float(i["price"]) for i in data}
-    return {s: pm[s] for s in symbols if s in pm}
+# ───────────────────────────── pure state machine ─────────────────────────────
+def _fav(d: float, c: List[float], x: float) -> bool:      # candle = [t,o,h,l,c]
+    return c[2] >= x if d > 0 else c[3] <= x
 
 
-async def _get_1m_hl(symbols: List[str]) -> Dict[str, Dict[str, float]]:
-    """Fetch last 2×1m candles — returns max high / min low / last close."""
-    out: Dict[str, Dict[str, float]] = {}
-    if not symbols:
-        return out
-    url = f"{BINANCE_FUTURES_REST}/fapi/v1/klines"
-    async with aiohttp.ClientSession() as session:
-        for sym in symbols:
-            try:
-                params = {"symbol": sym, "interval": "1m", "limit": 2}
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                    k = await r.json()
-                if isinstance(k, list) and k:
-                    out[sym] = {
-                        "high": max(float(x[2]) for x in k),
-                        "low":  min(float(x[3]) for x in k),
-                        "close": float(k[-1][4]),
-                    }
-            except Exception:
+def _adv(d: float, c: List[float], x: float) -> bool:
+    return c[3] <= x if d > 0 else c[2] >= x
+
+
+def _hist(t: Dict[str, Any], state: str, ts: int, price: float):
+    t.setdefault("history", []).append({"state": state, "ts": ts, "price": price})
+
+
+def _close(t: Dict[str, Any], outcome: str, ts: int, price: Optional[float], events: List[str], ambiguous=False):
+    if price is not None and t.get("remaining", 0) > 1e-9:
+        t["legs"].append({"price": price, "frac": t["remaining"], "reason": outcome, "ts": ts})
+        t["remaining"] = 0.0
+    t["status"], t["outcome"], t["closed_ms"] = "closed", outcome, ts
+    if ambiguous:
+        t["ambiguous"] = True
+    _hist(t, "closed:" + outcome, ts, price or 0.0)
+    events.append(outcome)
+
+
+def advance_trade(t: Dict[str, Any], candles: List[List[float]], step_ms: int = M1) -> List[str]:
+    """Process closed candles (chronological; 1m live, any step in backtests) for ONE trade. Mutates t, returns events."""
+    events: List[str] = []
+    d = 1.0 if str(t["direction"]).upper() == "LONG" else -1.0
+    for c in candles:
+        ts = int(c[0])
+        if ts < t["next_ts"] or t["status"] == "closed":
+            continue
+        t["next_ts"] = ts + step_ms
+        if t["status"] == "pending":
+            if ts >= t["expires_ms"]:
+                _close(t, "EXPIRED", ts, None, events)
+                break
+            touched = _adv(d, c, t["entry"])            # LONG: low<=entry ; SHORT: high>=entry
+            if not touched:
+                if _fav(d, c, t["tp1"]):                # target reached without us
+                    _close(t, "INVALIDATED", ts, None, events)
+                    break
                 continue
-    return out
+            t.update(status="open", fill_price=t["entry"], filled_ms=ts, remaining=1.0)
+            _hist(t, "filled", ts, t["entry"])
+            events.append("FILLED")
+            if _adv(d, c, t["sl"]):                     # same candle reaches the stop → ambiguous stop-out
+                _close(t, "SL", ts, t["sl"], events, ambiguous=True)
+                break
+            continue                                    # TPs are not evaluated on the fill candle
+        # open / partially exited
+        if ts - t["filled_ms"] >= MAX_HOLD_HOURS * 3_600_000:
+            _close(t, "TIME", ts, c[1], events)
+            break
+        while t["status"] != "closed":
+            idx = {"open": 0, "tp1_hit": 1, "tp2_hit": 2}[t["status"]]
+            tp = t[f"tp{idx + 1}"]
+            hit_tp, hit_sl = _fav(d, c, tp), _adv(d, c, t["sl"])
+            if hit_sl and hit_tp:
+                _close(t, "SL", ts, t["sl"], events, ambiguous=True)      # never assume the favourable path
+            elif hit_sl:
+                _close(t, "SL" if abs(t["sl"] - t["fill_price"]) / t["fill_price"] > 1e-9 or not t.get("be") else "BE",
+                       ts, t["sl"], events)
+            elif hit_tp:
+                frac = min(TP_SPLIT[idx], t["remaining"]) if idx < 2 else t["remaining"]
+                t["legs"].append({"price": tp, "frac": frac, "reason": f"TP{idx + 1}", "ts": ts})
+                t["remaining"] = max(0.0, t["remaining"] - frac)
+                events.append(f"TP{idx + 1}")
+                if idx == 2:
+                    _close(t, "TP3", ts, None, events)
+                else:
+                    t["status"] = f"tp{idx + 1}_hit"
+                    _hist(t, t["status"], ts, tp)
+                    if idx == 0 and MOVE_SL_TO_BE_AFTER_TP1:
+                        t["sl"], t["be"] = t["fill_price"], True
+                        if _adv(d, c, t["sl"]):         # BE touched in the same candle → conservative
+                            _close(t, "BE", ts, t["sl"], events, ambiguous=True)
+                    continue
+            break
+        if t["status"] == "closed":
+            break
+    if t["status"] == "closed":
+        t["result"] = compute_result(t)
+    return events
 
 
-def _key(t: Dict[str, Any]) -> str:
-    return f"{t.get('symbol','?')}|{t.get('opened_at','')}"
+# ───────────────────────────── IO ─────────────────────────────
+async def get_prices(symbols: List[str]) -> Dict[str, float]:
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{BINANCE_FUTURES_REST}/fapi/v1/ticker/price", timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json(content_type=None)
+    return {i["symbol"]: float(i["price"]) for i in data if i.get("symbol") in set(symbols)}
 
 
-def _append_closed(trade: Dict[str, Any]):
-    closed = _load(CLOSED_TRADES_FILE)
-    closed.append(trade)
-    _save(CLOSED_TRADES_FILE, closed)
+async def _closed_1m(session: aiohttp.ClientSession, symbol: str, start_ms: int) -> List[List[float]]:
+    async with session.get(f"{BINANCE_FUTURES_REST}/fapi/v1/klines",
+                           params={"symbol": symbol, "interval": "1m", "startTime": start_ms, "limit": 1000},
+                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+        data = await r.json(content_type=None)
+    if not isinstance(data, list):
+        raise RuntimeError(f"klines error: {str(data)[:120]}")
+    now = int(time.time() * 1000)
+    return [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in data if int(k[0]) + M1 <= now]
+
+
+def build_trade_record(signal: Dict[str, Any], now_ms: int, step_ms: int = M1) -> Dict[str, Any]:
+    """Initial tracked-trade record (shared by the live monitor and the backtest)."""
+    cmp_ = signal["entry_type"] == "CMP"
+    t = {
+        "id": f"{signal['symbol']}-{now_ms}", "symbol": signal["symbol"], "direction": signal["direction"],
+        "entry_type": signal["entry_type"], "entry": float(signal["entry"]), "sl": float(signal["sl"]),
+        "sl_initial": float(signal["sl"]), "tp1": float(signal["tp1"]), "tp2": float(signal["tp2"]),
+        "tp3": float(signal["tp3"]), "zone_low": signal.get("zone_low"), "zone_high": signal.get("zone_high"),
+        "score": signal.get("score"), "net_rr": signal.get("net_rr"), "setup_type": signal.get("setup_type"),
+        "ambiguous": False, "created_ms": now_ms, "next_ts": -(-now_ms // step_ms) * step_ms,
+        "expires_ms": now_ms + SIGNAL_EXPIRY_MIN * 60_000, "legs": [], "history": [],
+        "status": "open" if cmp_ else "pending", "remaining": 1.0 if cmp_ else 0.0,
+        "fill_price": float(signal["entry"]) if cmp_ else None, "filled_ms": now_ms if cmp_ else None,
+    }
+    _hist(t, "proposed", now_ms, t["entry"])
+    _hist(t, t["status"], now_ms, t["entry"])
+    return t
 
 
 async def add_trade(signal: Dict[str, Any]):
+    now = int(time.time() * 1000)
     async with _get_lock():
-        trades = _load(ACTIVE_TRADES_FILE)
-        t = dict(signal)
-        t["opened_at"] = datetime.utcnow().isoformat()
-        t["status"] = "pending" if t.get("entry_type") == "LIMIT" else "open"
-        t["tp_hits"] = []  # always initialize
-        trades.append(t)
-        _save(ACTIVE_TRADES_FILE, trades)
-    logger.info("Trade added: %s (%s)", signal["symbol"], t["status"])
+        data = _load(ACTIVE_TRADES_FILE)
+        if any(x["symbol"] == signal["symbol"] and x.get("status") != "closed" for x in data):
+            logger.info("Trade for %s already tracked — duplicate ignored", signal["symbol"])
+            return
+        t = build_trade_record(signal, now)
+        data.append(t)
+        _save(ACTIVE_TRADES_FILE, data)
+    logger.info("Tracking %s %s (%s)", t["symbol"], t["direction"], t["status"])
+
+
+def _msg(t: Dict[str, Any], ev: str) -> str:
+    s, d = t["symbol"], t["direction"]
+    if ev == "FILLED":
+        return f"🟡➡️🟢 *{s}* {d} LIMIT filled @ `{t['fill_price']:.6g}` _(simulated)_"
+    if ev in ("TP1", "TP2", "TP3"):
+        return f"🎯 *{s}* {d} {ev} hit @ `{t[ev.lower()]:.6g}`"
+    r = t.get("result", {})
+    tail = (f"\nNet: `{r['net_pct']:+.2f}%` · `{r['r_multiple']:+.2f}R` _(after fees/slippage/funding, simulated)_"
+            if r.get("filled") else "")
+    amb = "\n⚠️ TP and SL inside one 1m candle — booked conservatively as stop" if t.get("ambiguous") else ""
+    names = {"SL": "🛑 stop hit", "BE": "⚪ stopped at break-even", "TP3": "🏁 all targets hit", "EXPIRED": "⌛ limit expired unfilled",
+             "INVALIDATED": "🚫 invalidated (target reached before fill)", "TIME": "⏱ closed on max hold time"}
+    return f"{names.get(ev, ev)} — *{s}* {d}{tail}{amb}"
 
 
 async def monitor_loop():
-    logger.info("Trade monitor started (interval=%ds)", MONITOR_INTERVAL_SEC)
-
+    logger.info("Trade monitor started (every %ss)", MONITOR_INTERVAL_SEC)
     while True:
         try:
-            trades = _load(ACTIVE_TRADES_FILE)
-            pending = [t for t in trades if t.get("status") == "pending"]
-            active = [t for t in trades
-                      if t.get("status") in ("open", "tp1_hit", "tp2_hit")]
-
-            if not pending and not active:
-                await asyncio.sleep(MONITOR_INTERVAL_SEC)
-                continue
-
-            symbols = list({t["symbol"] for t in pending + active})
-            data = await _get_1m_hl(symbols)
-
-            fills: List[tuple] = []
-            closures: List[tuple] = []
-            tps: List[tuple] = []
-
             async with _get_lock():
-                current = _load(ACTIVE_TRADES_FILE)
-                remaining: List[Dict[str, Any]] = []
-
-                for t in current:
-                    st = t.get("status")
-                    sym = t["symbol"]
-                    d = t["direction"].upper()
-                    pd = data.get(sym)
-
-                    # Auto-init tp_hits for legacy trades
-                    if "tp_hits" not in t:
-                        t["tp_hits"] = []
-
-                    if st == "pending":
-                        if pd is None:
-                            remaining.append(t)
+                data = _load(ACTIVE_TRADES_FILE)
+            if data:
+                out_msgs: List[str] = []
+                async with aiohttp.ClientSession() as sess:
+                    for t in data:
+                        if t.get("status") == "closed":
                             continue
-                        filled = (
-                            (d == "LONG" and pd["low"] <= float(t["entry"]))
-                            or (d == "SHORT" and pd["high"] >= float(t["entry"]))
-                        )
-                        if filled:
-                            t["status"] = "open"
-                            t["filled_at"] = datetime.utcnow().isoformat()
-                            fills.append((sym, d, float(t["entry"])))
-                        remaining.append(t)
-                        continue
-
-                    if st in ("open", "tp1_hit", "tp2_hit"):
-                        if pd is None:
-                            remaining.append(t)
+                        try:
+                            cs = await _closed_1m(sess, t["symbol"], t["next_ts"])
+                        except Exception as exc:
+                            logger.warning("1m fetch %s failed: %s", t["symbol"], exc)
                             continue
-
-                        entry = float(t["entry"])
-                        sl = float(t["sl"])
-                        tp1, tp2, tp3 = (float(t["tp1"]), float(t["tp2"]),
-                                         float(t["tp3"]))
-
-                        sl_hit = (
-                            (d == "LONG" and pd["low"] <= sl)
-                            or (d == "SHORT" and pd["high"] >= sl)
-                        )
-                        if sl_hit:
-                            t["status"] = "closed"
-                            t["closed_at"] = datetime.utcnow().isoformat()
-                            t["exit_price"] = sl
-                            t["exit_reason"] = "SL"
-                            t["pnl_pct"] = round(
-                                calc_pnl(t, sl)["pnl_pct"], 4)
-                            _append_closed(t)
-                            closures.append((sym, "SL", sl,
-                                             t["pnl_pct"]))
-                            continue
-
-                        if d == "LONG":
-                            if st == "open" and pd["high"] >= tp1:
-                                t["status"] = "tp1_hit"
-                                t["tp_hits"].append("TP1")
-                                tps.append((sym, "TP1", tp1))
-                            elif st == "tp1_hit" and pd["high"] >= tp2:
-                                t["status"] = "tp2_hit"
-                                t["tp_hits"].append("TP2")
-                                tps.append((sym, "TP2", tp2))
-                            elif st == "tp2_hit" and pd["high"] >= tp3:
-                                t["status"] = "closed"
-                                t["closed_at"] = datetime.utcnow().isoformat()
-                                t["exit_price"] = tp3
-                                t["exit_reason"] = "TP3"
-                                t["pnl_pct"] = round(
-                                    calc_pnl(t, tp3)["pnl_pct"], 4)
-                                _append_closed(t)
-                                closures.append((sym, "TP3", tp3,
-                                                 t["pnl_pct"]))
-                                continue
-                        else:  # SHORT
-                            if st == "open" and pd["low"] <= tp1:
-                                t["status"] = "tp1_hit"
-                                t["tp_hits"].append("TP1")
-                                tps.append((sym, "TP1", tp1))
-                            elif st == "tp1_hit" and pd["low"] <= tp2:
-                                t["status"] = "tp2_hit"
-                                t["tp_hits"].append("TP2")
-                                tps.append((sym, "TP2", tp2))
-                            elif st == "tp2_hit" and pd["low"] <= tp3:
-                                t["status"] = "closed"
-                                t["closed_at"] = datetime.utcnow().isoformat()
-                                t["exit_price"] = tp3
-                                t["exit_reason"] = "TP3"
-                                t["pnl_pct"] = round(
-                                    calc_pnl(t, tp3)["pnl_pct"], 4)
-                                _append_closed(t)
-                                closures.append((sym, "TP3", tp3,
-                                                 t["pnl_pct"]))
-                                continue
-
-                        remaining.append(t)
-                        continue
-
-                    remaining.append(t)
-
-                _save(ACTIVE_TRADES_FILE, remaining)
-
-            for sym, d, px in fills:
-                await send_raw_message(
-                    f"✅ *Entry Filled* — `{sym}`\n"
-                    f"Direction: {d}\n"
-                    f"Fill: `{px}`"
-                )
-                logger.info("Limit filled: %s %s @ %s", sym, d, px)
-
-            for sym, tp, px in tps:
-                await send_raw_message(
-                    f"🎯 *{tp} Hit* — `{sym}`\n"
-                    f"Price: `{px}`"
-                )
-                logger.info("%s hit: %s @ %s", tp, sym, px)
-
-            for sym, reason, px, pnl in closures:
-                emoji = "✅" if reason.startswith("TP") else "❌"
-                await send_raw_message(
-                    f"{emoji} *Trade Closed* — `{sym}`\n"
-                    f"Reason: *{reason}* at `{px}`\n"
-                    f"PnL: `{pnl:+.2f}%`"
-                )
-                logger.info("Trade closed: %s %s @ %s (%.2f%%)",
-                            sym, reason, px, pnl)
-
-        except Exception as exc:
-            logger.error("Monitor error: %s", exc, exc_info=True)
-
+                        for ev in advance_trade(t, cs):
+                            out_msgs.append(_msg(t, ev))
+                async with _get_lock():
+                    cur = {x["id"]: x for x in _load(ACTIVE_TRADES_FILE)}
+                    for t in data:                         # merge: keep trades added while we were fetching
+                        cur[t["id"]] = t
+                    keep, closed = [], _load(CLOSED_TRADES_FILE)
+                    for t in cur.values():
+                        (closed if t.get("status") == "closed" else keep).append(t)
+                    _save(ACTIVE_TRADES_FILE, keep)
+                    _save(CLOSED_TRADES_FILE, closed)
+                for m in out_msgs:
+                    await send_raw_message(m)
+        except Exception:
+            logger.exception("monitor error")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)

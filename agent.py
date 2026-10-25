@@ -10,23 +10,23 @@ import os
 import random
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
 from config import (
     OPENROUTER_API_KEYS, OPENROUTER_BASE_URL, OPENROUTER_MODEL,
-    REASONING_EFFORT,
+    REASONING_EFFORT, ENGINE_ONLY_MODE, TOOL_STRICT_SCHEMA,
 )
-from telegram_sender import send_signal
-from signal_filter import refine_signal
+from risk import check_levels
 
 logger = logging.getLogger(__name__)
 
 _CLIENTS: List[AsyncOpenAI] = []
-_API_TIMEOUT = 420          # Nemotron Ultra is slow (reasoning) — 180s was killing many calls
-_MAX_ATTEMPTS = 3           # per group (same key)
-_GROUP_DEADLINE = 900       # stop retrying a group after this many seconds
+_SLEEP = asyncio.sleep       # indirection so tests can run without real delays
+_API_TIMEOUT = 240          # Nemotron Ultra is slow (reasoning) — 180s was killing many calls
+_MAX_ATTEMPTS = 2           # per group (same key)
+_GROUP_DEADLINE = 420       # stop retrying a group after this many seconds
 _LAUNCH_GAP_SEC = 1.0       # 1 request per second: group1 @0s, group2 @1s ... group15 @14s
 
 
@@ -49,78 +49,37 @@ def _get_clients() -> List[AsyncOpenAI]:
     return _CLIENTS
 
 
-SYSTEM_PROMPT = """You are an elite crypto futures day trader (SMC/ICT, liquidity, S/R, premium/discount).
-You get a compact JSON payload for a group of coins. Each coin has 1d, 4h, 1h, 15m sections.
-Goal: report ONLY A+ setups. Most scans should end in NO_SETUP — that is correct behaviour.
-A script re-verifies every number you send (and finalises the SL on 15m structure), so
-inconsistent or forced trades are discarded. Keep your reasoning concise; do not re-derive things twice.
+SYSTEM_PROMPT = """You are a strict reviewer of SCALP setups (ICT/SMC, crypto futures). A deterministic Python engine has ALREADY
+confirmed, on CLOSED candles only: 1H major trend/bias → 15m liquidity sweep+reclaim → 15m displacement MSS → fresh OB/FVG zone
+→ 5m entry confirmation (5m MSS + 5m FVG inside the 15m zone) → 15m-structure stop → structural targets.
+All numbers are computed by code. Your job is judgment, not arithmetic. Only the best-quality setup should survive.
 
-## Workflow (STRICT ORDER)
-1. 1d  — major bias.            2. 4h — refine bias, HTF OB/FVG.
-3. 1h  — MAIN BIAS: structure + premium/discount.
-4. 15m — SNIPER ENTRY: exact OB/FVG/POC zone, sweep, invalidation (SL).
+## Input (compact JSON, one entry per confirmed setup)
+s symbol | dir | type (continuation = with 1H trend) | et entry type (CMP=market, LIMIT) | e entry | z [zone low, high]
+sl stop | tp [tp1,tp2,tp3] and tps (what liquidity each target is) | nrr net RR to TP1 after fees/slippage/funding | risk% SL distance
+ctx {b1 = 1H bias, b15 = 15m bias (+1 bull/-1 bear/0), r1 = 1H dealing range [lo, eq, hi]} | atr ATR(15m) | px live price
+sw {level, src, ts, wick} = swept liquidity pool | mss {ref, ts, disp = displacement body in ATR, rv = relative volume, age}
+zone {kind OB/FVG/OB+FVG, touches} | r5 5m confirmation (confirmed) | c15 / c5 = last closed 15m / 5m candles [o,h,l,c], oldest first
 
-## Field meaning (read carefully — do not mix these up)
-ls        = LATEST structure event {t: BOS|CHOCH, d: +1 bullish / -1 bearish, ago: candles}. Use this for bias.
-bos/choch = last BOS / last CHOCH seen (+1 bull, -1 bear). They can be old and contradict each other; ls decides.
-swp       = recent sweep. t="bear": HIGHS were swept (price rejected down) → supports SHORT; l=level, ch=wick high.
-            t="bull": LOWS were swept (price rejected up) → supports LONG; l=level, cl=wick low.
-pd        = premium (above equilibrium eq) / discount (below). rh/rl/eq = 50-candle range high/low/equilibrium.
-pocH/pocL = POC zone; inPoc = CMP inside it; pocD = % distance CMP→POC. lc = last close (CMP).
-obL/fvgL  = up to 3 OBs/FVGs [{t: bull|bear, top, bot}]. bull zone = demand (for LONG), bear zone = supply (for SHORT).
-obM/fvgM  = "yes" = price already returned into/through the zone (mitigated), "no" = fresh. Prefer fresh zones.
-eqh/eql   = equal highs/lows (liquidity pools) {p: price, n: touches}. liqBS/liqSS = buy-side / sell-side liquidity.
-sr = S/R clusters, rsiDiv = RSI divergence, rv = relative volume, vah/val = value area, oteL/oteS = OTE zones,
-sh/sl and sh2/sl2 = last / previous swing high / low, atr = ATR(14) of that timeframe.
-
-## Direction rules (hard)
-- LONG  only if: entry is in DISCOUNT (below 1h eq), 1h ls.d = +1, and at least one more of 4h/1d agrees.
-- SHORT only if: entry is in PREMIUM  (above 1h eq), 1h ls.d = -1, and at least one more of 4h/1d agrees.
-- NEVER long in premium, NEVER short in discount, and NEVER trade against the 1h structure.
-- The sweep must match the direction: LONG needs swp.t="bull", SHORT needs swp.t="bear" (15m preferred, 1h acceptable).
-
-## MANDATORY 5 confirmations (ALL must be true)
-1. Structure aligned (1h + at least one of 4h/1d).
-2. Entry in discount (LONG) / premium (SHORT) relative to the 1h range.
-3. Entry sits INSIDE a same-direction OB or FVG (15m preferred; 1h/4h zone acceptable), ideally overlapping the POC zone.
-4. Recent same-direction liquidity sweep (see swp above).
-5. RSI supportive: LONG → 15m RSI < 65 (1h < 70); SHORT → 15m RSI > 35 (1h > 30). No opposite RSI divergence.
-If any one fails → NO_SETUP for that coin.
-
-## Entry
-- entry_type = "CMP", entry = lc  ONLY when CMP is already inside the chosen zone (inPoc=true or lc between zone bounds).
-- Otherwise entry_type = "LIMIT" at the best price inside the zone (POC/50% of the OB/FVG, fresh zone preferred):
-  LONG limit must be BELOW CMP, SHORT limit must be ABOVE CMP, and ≤ 2.5% away. Farther → NO_SETUP.
-- zone_high / zone_low = bounds of that 15m OB/FVG (for LIMIT).
-
-## SL (15m structure — most important)
-- LONG: SL below the 15m invalidation = lowest of {entry zone low, 15m sweep wick swp.cl, ...} minus 0.5×ATR(15m).
-- SHORT: SL above the 15m invalidation = highest of {entry zone high, 15m sweep wick swp.ch, ...} plus 0.5×ATR(15m).
-- Never use 1d/4h levels for SL. SL distance ≥ 0.8×ATR(15m) and ≤ 2% of entry. If a sane SL needs more than 2% → NO_SETUP.
-
-## TP (day-trade, reachable today)
-- TP1 = nearest liquidity pool (liqBS/eqh for LONG, liqSS/eql for SHORT) or nearest S/R cluster, whichever is closer (≤ 4% from entry).
-- TP2 = next liquidity/S-R level or VAH/VAL. TP3 = opposite-side liquidity or range_high/range_low (≤ 10% from entry).
-- LONG: sl < entry < tp1 < tp2 < tp3.  SHORT: sl > entry > tp1 > tp2 > tp3.
-- rr_ratio = |tp1 − entry| / |entry − sl|   (TP1 based!). Must be ≥ 1.5, otherwise NO_SETUP. Do NOT quote RR of TP2/TP3.
-
-## Confidence
-- "high"   : 1d + 4h + 1h all aligned, sweep on 15m, fresh OB/FVG zone, RR ≥ 2.
-- "medium" : 1h + one of 4h/1d aligned, everything else valid.
-- Anything weaker → NO_SETUP (do not send "low").
+## How to choose (be harsh — win rate matters more than frequency)
+Prefer: obvious higher-timeframe liquidity swept (src 1h:*), strong displacement (disp ≥ 1.2, rv ≥ 1.2), fresh zone (touches 0),
+price already close to the entry, 1H and 15m bias both with the trade, targets on real liquidity with room before opposing levels,
+clean candles in c15/c5 (no big opposing wick/absorption at the entry). Reject: choppy/overlapping candles, an entry that already
+looks tested several times, a stop that is inside noise, targets blocked by nearby opposing liquidity, anything contradictory.
+If no setup is clearly A-grade → reply exactly: NO_SETUP. Otherwise pick AT MOST ONE: the single best.
 
 ## Output
-- Pick at most ONE coin per group: the single best A+ setup. Call `send_trade_signal` with exact numbers and the
-  coin's exact symbol as in the payload (e.g. "BTCUSDT").
-- Before calling, self-check: direction vs premium/discount, sweep type vs direction, TP/SL ordering, RR to TP1 ≥ 1.5,
-  and that your `reason` contains no contradictions. `reason` ≤ 350 characters, quote real payload values.
-- If no coin qualifies, reply exactly "NO_SETUP"."""
+Call `send_trade_signal` once, COPYING the chosen setup's numbers exactly (symbol, direction, entry_type, entry, zone_high,
+zone_low, sl, tp1, tp2, tp3). Never alter or invent levels — the server rejects any mismatch. `reason` ≤ 300 chars, factual,
+only values present in the input. `confidence`/`rr_ratio` are informational; the server ignores and recomputes them.
+Never state a win probability."""
 
 TOOLS = [{
     "type": "function",
     "function": {
+        **({"strict": True} if TOOL_STRICT_SCHEMA else {}),
         "name": "send_trade_signal",
-        "description": "Send a confirmed SMC/ICT day-trade signal.",
+        "description": "Select ONE engine-confirmed scalp setup (numbers must be copied exactly).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -141,10 +100,10 @@ TOOLS = [{
                 "sweep_level": {"type": "number"},
                 "rr_ratio": {"type": "number"},
             },
+            "additionalProperties": False,
             "required": [
                 "symbol", "direction", "entry_type", "entry",
-                "sl", "tp1", "tp2", "tp3", "confidence",
-                "reason", "rr_ratio",
+                "sl", "tp1", "tp2", "tp3", "reason",
             ],
         },
     },
@@ -162,67 +121,50 @@ def _save_reasoning(tag: str, reasoning: str):
         logger.warning("Could not save reasoning: %s", e)
 
 
-def _norm_symbol(s: Any) -> str:
-    s = str(s or "").upper().strip()
-    s = s.replace("/", "").replace(":USDT", "").replace("-", "")
-    return s
+def _norm_symbol(x: Any) -> str:
+    return str(x or "").upper().strip().replace("/", "").replace(":USDT", "").replace("-", "")
 
 
-def _validate_signal(args: Dict[str, Any], symbols: List[str],
-                     group_id: int) -> Optional[Dict[str, Any]]:
-    """Make sure the model's tool call is complete & sane. Bad ones are dropped
-    (otherwise they crash ranking / the trade monitor)."""
+def _close(a: float, b: float, tol: float) -> bool:
+    return abs(a - b) <= tol
+
+
+def validate_against_candidate(args: Dict[str, Any], cands: Dict[str, Dict[str, Any]],
+                               group_id: int) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Server-side contract check. The model may only SELECT an engine candidate; numbers must match it.
+    Returns (final_signal, '') or (None, exact_rejection_reason). Model rr/confidence are never trusted."""
+    if not isinstance(args, dict):
+        return None, "tool arguments are not an object"
+    sym = _norm_symbol(args.get("symbol"))
+    cand = cands.get(sym)
+    if cand is None:
+        return None, f"symbol {args.get('symbol')!r} is not a candidate of group {group_id}"
+    req = ("direction", "entry_type", "entry", "sl", "tp1", "tp2", "tp3", "reason")
+    miss = [k for k in req if args.get(k) in (None, "")]
+    if miss:
+        return None, f"{sym}: missing required field(s) {miss}"
     try:
-        sym = _norm_symbol(args.get("symbol"))
-        if sym not in symbols:
-            logger.warning("Group %d: signal symbol %r not in group %s — dropped",
-                           group_id, args.get("symbol"), symbols)
-            return None
-        args["symbol"] = sym
-
-        d = str(args.get("direction", "")).upper()
-        if d not in ("LONG", "SHORT"):
-            logger.warning("Group %d: bad direction %r — dropped", group_id, d)
-            return None
-        args["direction"] = d
-
-        et = str(args.get("entry_type", "CMP")).upper()
-        args["entry_type"] = et if et in ("CMP", "LIMIT") else "CMP"
-
-        conf = str(args.get("confidence", "low")).lower()
-        args["confidence"] = conf if conf in ("low", "medium", "high") else "low"
-
-        for k in ("entry", "sl", "tp1", "tp2", "tp3"):
-            args[k] = float(args[k])
-        for k in ("zone_high", "zone_low", "poc_high", "poc_low", "sweep_level"):
-            if args.get(k) is not None:
-                try:
-                    args[k] = float(args[k])
-                except (TypeError, ValueError):
-                    args[k] = None
-
-        e, sl, t1, t2, t3 = (args["entry"], args["sl"], args["tp1"],
-                             args["tp2"], args["tp3"])
-        if min(e, sl, t1, t2, t3) <= 0:
-            logger.warning("Group %d: %s non-positive price — dropped", group_id, sym)
-            return None
-        if d == "LONG" and not (sl < e < t1 < t2 < t3):
-            logger.warning("Group %d: %s LONG levels invalid (sl=%s e=%s tp=%s/%s/%s) — dropped",
-                           group_id, sym, sl, e, t1, t2, t3)
-            return None
-        if d == "SHORT" and not (sl > e > t1 > t2 > t3):
-            logger.warning("Group %d: %s SHORT levels invalid (sl=%s e=%s tp=%s/%s/%s) — dropped",
-                           group_id, sym, sl, e, t1, t2, t3)
-            return None
-
-        # always compute RR from the real numbers (model's own value can be wrong/missing)
-        risk = abs(e - sl)
-        args["rr_ratio"] = round(abs(t1 - e) / risk, 2) if risk > 0 else 0.0   # real RR to TP1, never the model's claim
-        args["reason"] = str(args.get("reason", ""))
-        return args
-    except (KeyError, TypeError, ValueError) as exc:
-        logger.warning("Group %d: incomplete signal (%s) — dropped", group_id, exc)
-        return None
+        nums = {k: float(args[k]) for k in ("entry", "sl", "tp1", "tp2", "tp3")}
+    except (TypeError, ValueError):
+        return None, f"{sym}: non-numeric price field"
+    if str(args["direction"]).upper() != cand["direction"]:
+        return None, f"{sym}: direction {args['direction']} contradicts engine {cand['direction']}"
+    if str(args["entry_type"]).upper() != cand["entry_type"]:
+        return None, f"{sym}: entry_type {args['entry_type']} contradicts engine {cand['entry_type']}"
+    err = check_levels(cand["direction"], nums["entry"], nums["sl"], nums["tp1"], nums["tp2"], nums["tp3"])
+    if err:
+        return None, f"{sym}: {err}"
+    tol = 0.1 * cand["atr15"]
+    for k in ("entry", "sl", "tp1", "tp2", "tp3"):
+        if not _close(nums[k], cand[k], tol):
+            return None, f"{sym}: {k}={nums[k]} does not match engine value {cand[k]} (tol {tol:.6g})"
+    out = {k: v for k, v in cand.items() if not k.startswith("_")}
+    out["model_confidence"] = str(args.get("confidence", ""))
+    out["reason"] = str(args["reason"])[:350]
+    out["confidence"] = "high" if cand["score"] >= 80 else "medium" if cand["score"] >= 70 else "standard"
+    out["rr_ratio"] = cand["net_rr"]
+    out["_group_id"] = group_id
+    return out, ""
 
 
 def _retry_after(exc: Exception) -> Optional[float]:
@@ -233,203 +175,159 @@ def _retry_after(exc: Exception) -> Optional[float]:
         return None
 
 
-async def _analyze_group(client, key_idx: int, group_id: int,
-                         symbols: List[str], payload: str,
-                         data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Group {group_id} — analyse these {len(symbols)} coins:\n{payload}"},
-    ]
+class _LaunchGate:
+    """Global rate limiter: at most one request START per `gap` seconds across ALL workers (incl. retries)."""
+    def __init__(self, gap: float):
+        self.gap, self._next, self._lock = gap, 0.0, asyncio.Lock()
 
-    started = time.monotonic()
-    effort = REASONING_EFFORT
-    msg = None
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next - now)
+            self._next = max(now, self._next) + self.gap
+        if delay:
+            await _SLEEP(delay)
+
+
+async def _analyze_group(client, key_idx: int, group: Dict[str, Any], gate: _LaunchGate) -> Dict[str, Any]:
+    gid, cands = group["id"], group["cands"]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Group {gid} candidates:\n{group['payload']}"}]
+    started, effort, msg = time.monotonic(), REASONING_EFFORT, None
+    report = {"group": gid, "key": key_idx, "status": "failed", "error": "", "signal": None}
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        wait = 0.0
+        await gate.wait()
+        wait, err = 0.0, ""
         try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=OPENROUTER_MODEL,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    max_tokens=8000,
-                    extra_body={"reasoning": {"effort": effort, "enabled": True}},
-                ),
-                timeout=_API_TIMEOUT,
-            )
+            tool = TOOLS
+            response = await asyncio.wait_for(client.chat.completions.create(
+                model=OPENROUTER_MODEL, messages=messages, tools=tool, tool_choice="auto", max_tokens=8000,
+                extra_body={"reasoning": {"effort": effort, "enabled": True}}), timeout=_API_TIMEOUT)
         except asyncio.TimeoutError:
-            logger.warning("⌛ Group %d (key %d): timeout after %ds (attempt %d/%d)",
-                           group_id, key_idx, _API_TIMEOUT, attempt, _MAX_ATTEMPTS)
-            wait = 5
+            err, wait = f"timeout {_API_TIMEOUT}s", 5
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             if status in (401, 402, 403):
-                logger.error("❌ Group %d: API key %d rejected (%s). Skipping group.",
-                             group_id, key_idx, status)
-                return []
+                report["error"] = f"key {key_idx} rejected ({status})"
+                logger.error("Group %d: %s", gid, report["error"])
+                return report
             if status == 429:
-                wait = _retry_after(exc) or (20 * attempt)
-                logger.warning("⏳ Group %d (key %d): rate limited 429 — retry in %.0fs (attempt %d/%d)",
-                               group_id, key_idx, wait, attempt, _MAX_ATTEMPTS)
+                wait = _retry_after(exc) or 20 * attempt
+                err = "429 rate limited"
             else:
-                wait = 5 * attempt + random.uniform(0, 3)
-                logger.warning("Group %d (key %d): %s %s (attempt %d/%d)",
-                               group_id, key_idx, status or type(exc).__name__,
-                               str(exc)[:200], attempt, _MAX_ATTEMPTS)
+                err, wait = f"{status or type(exc).__name__}: {str(exc)[:120]}", 5 * attempt
         else:
-            # OpenRouter can answer HTTP 200 with an {"error": ...} body and no choices
             choices = getattr(response, "choices", None)
             if not choices:
-                err = getattr(response, "error", None)
-                if err is None and getattr(response, "model_extra", None):
-                    err = response.model_extra.get("error")
-                logger.warning("Group %d (key %d): empty/error response body: %s (attempt %d/%d)",
-                               group_id, key_idx, str(err)[:200], attempt, _MAX_ATTEMPTS)
-                wait = 5 * attempt + random.uniform(0, 3)
+                e = getattr(response, "error", None) or (getattr(response, "model_extra", None) or {}).get("error")
+                err, wait = f"empty/error body: {str(e)[:120]}", 5 * attempt
             else:
-                choice = choices[0]
-                msg = choice.message
-                finish = getattr(choice, "finish_reason", None)
-                if not msg.tool_calls and not (msg.content or "").strip() \
-                        and finish == "length":
-                    # all 8000 tokens were eaten by reasoning → retry with less thinking
-                    logger.warning("Group %d: output cut (finish=length, no answer) — retrying with lower reasoning",
-                                   group_id)
+                ch = choices[0]
+                m = ch.message
+                if not m.tool_calls and not (m.content or "").strip() and getattr(ch, "finish_reason", None) == "length":
                     effort = "medium" if effort == "high" else "low"
-                    msg = None
-                    wait = 2
+                    err, wait = "output cut by reasoning (length) → lower effort", 2
                 else:
+                    msg = m
                     break
-
-        if attempt == _MAX_ATTEMPTS or (time.monotonic() - started) + wait > _GROUP_DEADLINE:
+        report["error"] = err
+        logger.warning("Group %d (key %d) attempt %d/%d: %s", gid, key_idx, attempt, _MAX_ATTEMPTS, err)
+        wait += random.uniform(0, 2) + 2 ** (attempt - 1)               # bounded exponential backoff + jitter
+        if attempt == _MAX_ATTEMPTS or time.monotonic() - started + wait > _GROUP_DEADLINE:
             break
-        await asyncio.sleep(wait)
+        await _SLEEP(wait)
 
     if msg is None:
-        logger.error("❌ Group %d (key %d) FAILED after retries — no result", group_id, key_idx)
-        return []
+        logger.error("Group %d FAILED after retries: %s", gid, report["error"])
+        return report
 
-    # OpenRouter sometimes returns reasoning in model_extra or directly
-    reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
-    if not reasoning and getattr(msg, "model_extra", None):
-        reasoning = msg.model_extra.get("reasoning") or msg.model_extra.get("reasoning_content")
-
+    reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) \
+        or (getattr(msg, "model_extra", None) or {}).get("reasoning")
     if reasoning:
-        logger.info("🧠 Group %d reasoning (%d chars): %s …",
-                    group_id, len(reasoning), reasoning[:300].replace("\n", " "))
-        _save_reasoning(f"group{group_id}", reasoning)
+        _save_reasoning(f"group{gid}", reasoning)
 
+    report["status"], report["error"] = "ok", ""
     if not msg.tool_calls:
-        content = (msg.content or "").strip()
-        if content:
-            logger.info("Group %d reply: %s", group_id, content[:150])
-        else:
-            logger.info("Group %d → NO_SETUP", group_id)
-        return []
-
-    signals: List[Dict[str, Any]] = []
-    for tc in msg.tool_calls:
-        if tc.function.name != "send_trade_signal":
-            continue
-        try:
-            args = json.loads(tc.function.arguments)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Group %d: tool-call JSON could not be parsed", group_id)
-            continue
-        if not isinstance(args, dict):
-            continue
-
-        args = _validate_signal(args, symbols, group_id)
-        if not args:
-            continue
-
-        if data and data.get(args["symbol"]):
-            raw_sl = args["sl"]
-            args, why = refine_signal(args, data[args["symbol"]])
-            if not args:
-                logger.info("🚫 Group %d: signal rejected by A+ filter — %s", group_id, why)
-                continue
-            logger.info("✅ Group %d: %s passed A+ filter (score %.1f) | model SL %s → 15m SL %s | RR(TP1) %.2f",
-                        group_id, args["symbol"], args["score"], raw_sl, args["sl"], args["rr_ratio"])
-
-        args["_group_id"] = group_id
-        logger.info("🚀 Group %d signal: %s %s (%s, conf=%s, RR=%.2f)",
-                    group_id, args["direction"], args["symbol"],
-                    args["entry_type"], args["confidence"], args["rr_ratio"])
-        signals.append(args)
-
-    if not signals:
-        logger.info("Group %d → no valid signal", group_id)
-    return signals
+        logger.info("Group %d → NO_SETUP (%s)", gid, (msg.content or "").strip()[:80])
+        report["status"] = "no_setup"
+        return report
+    tcs = [tc for tc in msg.tool_calls if tc.function.name == "send_trade_signal"]
+    if len(tcs) > 1:
+        logger.warning("Group %d: model returned %d signals, only the first is considered", gid, len(tcs))
+    try:
+        args = json.loads(tcs[0].function.arguments)
+    except Exception:
+        report["status"], report["error"] = "invalid", "tool-call JSON not parseable"
+        return report
+    sig, why = validate_against_candidate(args, cands, gid)
+    if sig is None:
+        logger.warning("🚫 Group %d signal rejected: %s", gid, why)
+        report["status"], report["error"] = "rejected", why
+        return report
+    logger.info("✅ Group %d accepted: %s %s score=%.1f netRR=%.2f", gid, sig["direction"], sig["symbol"],
+                sig["score"], sig["net_rr"])
+    report["signal"] = sig
+    return report
 
 
-def _rank_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    conf_score = {"high": 3, "medium": 2, "low": 1}
-    by_symbol: Dict[str, Dict] = {}
-    for s in signals:
-        sym = s["symbol"]
-        if sym not in by_symbol:
-            by_symbol[sym] = s
-        else:
-            if s.get("score", 0) > by_symbol[sym].get("score", 0):
-                by_symbol[sym] = s
-
-    return sorted(
-        by_symbol.values(),
-        key=lambda x: (float(x.get("score", 0)), conf_score.get(x.get("confidence"), 0),
-                       float(x.get("rr_ratio", 0))),
-        reverse=True,
-    )
+def rank_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministic: heuristic quality score → net RR → symbol (stable). Not a win probability."""
+    return sorted(signals, key=lambda x: (-float(x["score"]), -float(x["net_rr"]), x["symbol"]))
 
 
-async def run_agent_batch(groups: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+async def run_agent_batch(groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Bounded worker queue: every group is processed even if groups > keys. Returns {'best', 'reports'}."""
+    if ENGINE_ONLY_MODE:
+        sigs = []
+        for g in groups:
+            c = max(g["cands"].values(), key=lambda x: x["score"])
+            sigs.append({**{k: v for k, v in c.items() if not k.startswith("_")}, "reason": "engine-only (no LLM review)",
+                         "confidence": "standard", "rr_ratio": c["net_rr"], "_group_id": g["id"]})
+        return {"best": rank_signals(sigs)[0] if sigs else None, "reports": []}
+
     clients = _get_clients()
     if not clients:
-        return None
+        logger.error("No OpenRouter keys — cannot review candidates (fail closed)")
+        return {"best": None, "reports": [{"status": "failed", "error": "no API keys"}]}
+    q: asyncio.Queue = asyncio.Queue()
+    for g in groups:
+        q.put_nowait(g)
+    gate = _LaunchGate(_LAUNCH_GAP_SEC)
+    reports: List[Dict[str, Any]] = []
 
-    n = min(len(clients), len(groups))
+    async def worker(idx: int):
+        while True:
+            try:
+                g = q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                reports.append(await _analyze_group(clients[idx], idx + 1, g, gate))
+            except Exception as exc:
+                logger.error("Group %s crashed: %r", g.get("id"), exc, exc_info=True)
+                reports.append({"group": g.get("id"), "status": "failed", "error": repr(exc), "signal": None})
 
-    async def _staggered_task(idx: int):
-        # 1 request per second: group i is launched at i seconds.
-        # After launch every group runs in parallel with its own API key
-        # (no semaphore — that was serialising the calls before).
-        await asyncio.sleep(idx * _LAUNCH_GAP_SEC)
-        logger.info("📤 Launching group %d (key %d) at +%.0fs",
-                    groups[idx]["id"], idx + 1, idx * _LAUNCH_GAP_SEC)
-        return await _analyze_group(
-            clients[idx], idx + 1, groups[idx]["id"],
-            groups[idx]["symbols"], groups[idx]["payload"],
-            groups[idx].get("data"),
-        )
+    await asyncio.gather(*[worker(i) for i in range(min(len(clients), len(groups)))])
+    failed = [r for r in reports if r["status"] in ("failed", "invalid")]
+    logger.info("Groups: %d processed, %d failed, %d rejected, %d no_setup",
+                len(reports), len(failed), sum(r["status"] == "rejected" for r in reports),
+                sum(r["status"] == "no_setup" for r in reports))
+    sigs = [r["signal"] for r in reports if r.get("signal")]
+    return {"best": rank_signals(sigs)[0] if sigs else None, "reports": reports}
 
-    tasks = [_staggered_task(i) for i in range(n)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_signals: List[Dict[str, Any]] = []
-    failed = 0
-    for r in results:
-        if isinstance(r, Exception):
-            failed += 1
-            logger.error("Task crashed: %r", r, exc_info=r)
-            continue
-        if r:
-            all_signals.extend(r)
-    if failed:
-        logger.warning("%d/%d groups crashed", failed, n)
+_GATE = _LaunchGate(_LAUNCH_GAP_SEC)
 
-    if not all_signals:
-        logger.info("All groups → NO_SETUP (or failed)")
-        return None
 
-    ranked = _rank_signals(all_signals)
-    best = ranked[0]
-
-    logger.info("🏆 Best signal (highest score): %s %s score=%.1f conf=%s RR=%.2f from group %d",
-                best["direction"], best["symbol"], best.get("score", 0), best.get("confidence"),
-                best.get("rr_ratio", 0), best.get("_group_id", 0))
-
-    if await send_signal(best):
-        return best
-    return None
+async def run_group(group: Dict[str, Any], key_index: int) -> Dict[str, Any]:
+    """Review ONE payload with ONE specific api key (called per scan by main's round-robin)."""
+    clients = _get_clients()
+    if ENGINE_ONLY_MODE:
+        c = max(group["cands"].values(), key=lambda x: x["score"])
+        sig = {**{k: v for k, v in c.items() if not k.startswith("_")}, "reason": "engine-only (no LLM review)",
+               "confidence": "standard", "rr_ratio": c["net_rr"], "_group_id": group["id"]}
+        return {"status": "ok", "signal": sig, "error": ""}
+    if not clients:
+        return {"status": "failed", "signal": None, "error": "no API keys"}
+    return await _analyze_group(clients[key_index % len(clients)], key_index % len(clients) + 1, group, _GATE)

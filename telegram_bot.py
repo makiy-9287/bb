@@ -14,8 +14,8 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID,
     SLST_START, SLST_END, SLST_UTC_OFFSET,
     SCAN_INTERVAL_MIN, TOP_COINS_LIMIT,
-    OPENROUTER_MODEL, REASONING_EFFORT,
-    OFF_WEEKDAYS, DAY_NAMES,
+    OPENROUTER_MODEL, OPENROUTER_API_KEYS,
+    OFF_WEEKDAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ AGENT_STATE: Dict[str, Any] = {
     "signal_count": 0,
     "last_signal":  None,
     "scan_trigger": None,
+    "enabled":      True,
 }
 
 
@@ -87,62 +88,57 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
     await _reply(update,
-        "🤖 *v6 ULTRA Commands*\n"
+        "🤖 *Scalp Hybrid Commands*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/status — agent health & schedule\n"
+        "/on     — start scanning (no time limit)\n"
+        "/off    — stop scanning (trade monitor keeps running)\n"
+        "/status — agent health\n"
         "/trades — active + pending trades\n"
-        "/pnl    — performance summary\n"
-        "/scan   — trigger manual scan\n"
+        "/pnl    — net performance (fees/slippage/funding)\n"
+        "/stats  — same as /pnl\n"
+        "/scan   — scan now (still obeys ON/OFF)\n"
         "/help   — this message"
     )
+
+
+async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    AGENT_STATE["enabled"] = True
+    await _reply(update, "🟢 Scanning *ON* — a scan runs after every 5m candle close.")
+
+
+async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    AGENT_STATE["enabled"] = False
+    await _reply(update, "🔴 Scanning *OFF* — open/pending trades are still tracked.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
-
-    now = _slst_now()
-    day = DAY_NAMES[now.weekday()]
-    in_win = _in_window(now)
-
+    now = datetime.now(timezone.utc)
     started = AGENT_STATE.get("started_at")
     uptime = _fmt_dur((now - started).total_seconds()) if started else "?"
-
-    if in_win:
-        m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
-        next_evt = f"next scan in {m}m"
-        status_line = "🟢 *ACTIVE*"
-    elif now.weekday() in OFF_WEEKDAYS:
-        wait = (_next_window_start(now) - now).total_seconds()
-        next_evt = f"sleeps until Mon {SLST_START.strftime('%H:%M')} ({_fmt_dur(wait)})"
-        status_line = "😴 *OFF-DAY*"
-    else:
-        wait = (_next_window_start(now) - now).total_seconds()
-        next_evt = f"next window in {_fmt_dur(wait)}"
-        status_line = "⏸ *OUTSIDE HOURS*"
-
     ls = AGENT_STATE.get("last_scan_at")
-    ls_str = ls.strftime("%H:%M:%S SLST") if ls else "—"
+    ls_str = ls.strftime("%H:%M:%S UTC") if ls else "—"
     sig = AGENT_STATE.get("last_signal")
-    sig_str = (f"{sig['direction']} {sig['symbol']} ({sig.get('confidence','?')})"
-               if sig else "—")
-
+    sig_str = (f"{sig['direction']} {sig['symbol']} ({sig.get('confidence','?')})" if sig else "—")
+    on = AGENT_STATE.get("enabled", True)
+    m = SCAN_INTERVAL_MIN - (now.minute % SCAN_INTERVAL_MIN)
     await _reply(update,
-        f"🤖 *v6 ULTRA Status*\n"
+        f"🤖 *Scalp Hybrid Status*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{status_line}\n"
-        f"📅 `{day}` | `{now.strftime('%H:%M:%S')} SLST`\n"
+        f"{'🟢 *ON*' if on else '🔴 *OFF*'}\n"
         f"⏱ Uptime: `{uptime}`\n"
-        f"📊 Scans: `{AGENT_STATE.get('scan_count', 0)}`\n"
-        f"🚀 Signals: `{AGENT_STATE.get('signal_count', 0)}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Scans: `{AGENT_STATE.get('scan_count', 0)}` · 🚀 Signals: `{AGENT_STATE.get('signal_count', 0)}`\n"
         f"🔍 Last scan: `{ls_str}`\n"
         f"📈 Last signal: `{sig_str}`\n"
-        f"⏭ {next_evt}\n"
+        f"⏭ Next scan in ≈`{m}m`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 `{OPENROUTER_MODEL}`\n"
-        f"⚙️ Reasoning: `{REASONING_EFFORT}`\n"
-        f"🪙 `{TOP_COINS_LIMIT}` coins | `1D/4H/1H/15m`"
+        f"🧠 `{OPENROUTER_MODEL}` · keys: `{len(OPENROUTER_API_KEYS)}`\n"
+        f"🪙 `{TOP_COINS_LIMIT}` coins | `1H bias · 15m setup · 5m entry`"
     )
 
 
@@ -197,47 +193,28 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
     from trade_monitor import get_closed_trades
+    from performance import summarize
 
-    closed = get_closed_trades()
-    if not closed:
+    s = summarize(get_closed_trades())
+    if not s["signals_closed"]:
         await _reply(update, "📭 No closed trades.")
         return
 
-    wins = losses = 0
-    total = 0.0
-    best = worst = None
-
-    for t in closed:
-        e = float(t["entry"])
-        x = float(t.get("exit_price", e))
-        if e == 0:
-            continue
-        pct = ((x - e) / e * 100) if t["direction"].upper() == "LONG" \
-              else ((e - x) / e * 100)
-        total += pct
-        if pct >= 0:
-            wins += 1
-        else:
-            losses += 1
-        if best is None or pct > best[0]:
-            best = (pct, t)
-        if worst is None or pct < worst[0]:
-            worst = (pct, t)
-
-    n = wins + losses
-    wr = (wins / n * 100) if n else 0
-    b_str = f"+{best[0]:.2f}% ({best[1]['symbol']})" if best else "—"
-    w_str = f"{worst[0]:.2f}% ({worst[1]['symbol']})" if worst else "—"
-
+    def f(x, fmt="{:.2f}"):
+        return "n/a" if x is None else fmt.format(x)
+    wr = "n/a" if s["win_rate"] is None else f"{s['win_rate'] * 100:.1f}% ({s['wins']}/{s['filled']})"
+    fr = "n/a" if s["fill_rate"] is None else f"{s['fill_rate'] * 100:.0f}%"
     await _reply(update,
-        f"📈 *Performance*\n"
+        f"📈 *Performance* _(simulated, net of costs)_\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Total: `{n}` | ✅ `{wins}` | ❌ `{losses}`\n"
-        f"Win rate: `{wr:.1f}%`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Cumulative: `{total:+.2f}%`\n"
-        f"Best: `{b_str}`\n"
-        f"Worst: `{w_str}`"
+        f"Filled: `{s['filled']}` · expired `{s['unfilled_expired']}` · invalidated `{s['unfilled_invalidated']}`\n"
+        f"Fill rate: `{fr}` · ambiguous: `{s['ambiguous']}`\n"
+        f"Win rate: `{wr}`\n"
+        f"Avg win/loss: `{f(s['avg_win_r'])}R` / `{f(s['avg_loss_r'])}R`\n"
+        f"Expectancy: `{f(s['expectancy_r'], '{:+.2f}')}R` · PF: `{f(s['profit_factor'])}`\n"
+        f"Total: `{s['total_r']:+.2f}R` · max DD: `{s['max_drawdown_r']:.2f}R`\n"
+        f"Costs: fees `{s['fees_pct_sum']:.2f}%` slip `{s['slippage_pct_sum']:.2f}%` fund `{s['funding_pct_sum']:+.2f}%`\n"
+        f"_Small samples are not evidence of an edge._"
     )
 
 
@@ -248,8 +225,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ev is None:
         await _reply(update, "⚠️ Manual scan not available.")
         return
+    if not AGENT_STATE.get("enabled", True):
+        await _reply(update, "🔴 Scanning is OFF — use /on first.")
+        return
     ev.set()
-    await _reply(update, "🚀 Manual scan triggered.")
+    await _reply(update, "🚀 Manual scan queued (same validation and rate limits as scheduled scans).")
 
 
 # ── lifecycle ────────────────────────────────────────────────────
@@ -265,6 +245,9 @@ async def telegram_bot_loop():
     app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
     app.add_handler(CommandHandler("scan",   cmd_scan))
+    app.add_handler(CommandHandler("on",     cmd_on))
+    app.add_handler(CommandHandler("off",    cmd_off))
+    app.add_handler(CommandHandler("stats",  cmd_pnl))
 
     await app.initialize()
     await app.start()

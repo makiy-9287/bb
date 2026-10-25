@@ -7,12 +7,17 @@ import logging
 import aiohttp
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, TELEGRAM_BROADCAST_IDS,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, TELEGRAM_BROADCAST_IDS, SIGNAL_EXPIRY_MIN,
 )
 
 logger = logging.getLogger(__name__)
 
 _MD_SPECIALS = ("_", "*", "`", "[", "]")
+
+
+def _redact(msg: str) -> str:
+    """Never let the bot token reach the logs (aiohttp errors embed the request URL)."""
+    return msg.replace(TELEGRAM_BOT_TOKEN, "<token>") if TELEGRAM_BOT_TOKEN else msg
 
 
 def _escape_md(text: str) -> str:
@@ -49,7 +54,7 @@ async def _send_to(chat_id: str, text: str) -> bool:
                     return True
                 body = await r.text()
                 logger.error("Telegram to %s failed %s: %s",
-                             chat_id, r.status, body[:200])
+                             chat_id, r.status, _redact(body[:200]))
                 if r.status == 400 and "parse" in body.lower():
                     # Markdown entity error → resend as plain text so signal isn't lost
                     plain = dict(payload)
@@ -60,7 +65,7 @@ async def _send_to(chat_id: str, text: str) -> bool:
                         return r2.status == 200
                 return False
     except Exception as exc:
-        logger.error("Telegram exception to %s: %s", chat_id, exc)
+        logger.error("Telegram exception to %s: %s", chat_id, _redact(str(exc)))
         return False
 
 
@@ -99,9 +104,11 @@ async def send_signal(signal: dict) -> bool:
         f"🎯 TP2:  `{signal.get('tp2', '-')}`\n"
         f"🎯 TP3:  `{signal.get('tp3', '-')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Confidence: `{signal.get('confidence', '-')}`\n"
-        f"📈 R:R (TP1): `{signal.get('rr_ratio', '-')}`\n"
-        f"⭐ Score: `{signal.get('score', '-')}/100`\n"
+        f"🧭 Setup: `{signal.get('setup_type', '-')}` · grade `{signal.get('confidence', '-')}`\n"
+        f"📈 Net R:R (TP1, after costs): `{signal.get('net_rr', signal.get('rr_ratio', '-'))}` "
+        f"· gross `{signal.get('gross_rr', '-')}`\n"
+        f"⭐ Heuristic score: `{signal.get('score', '-')}/100` _(ranking only, not a win probability)_\n"
+        f"⏳ Limit expires in `{SIGNAL_EXPIRY_MIN}m` if unfilled\n"
         f"📝 {reason}"
     )
     return await _broadcast(text)

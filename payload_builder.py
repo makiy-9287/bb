@@ -1,74 +1,38 @@
-"""
-Compact JSON payload builder.
-Uses config.TIMEFRAMES + new v6 ULTRA fields.
-"""
+"""Compact payload for the LLM reviewer: only fully-confirmed setups, with the evidence needed to judge them."""
 import json
-import logging
 from typing import Any, Dict, List
 
-from config import TIMEFRAMES
-
-logger = logging.getLogger(__name__)
-
-_KEY_MAP = {
-    "symbol": "s",
-    "rsi": "rsi", "ema20": "e20", "ema50": "e50", "ema200": "e200",
-    "ema_trend": "et", "atr": "atr", "atr_pct": "atrp",
-    "poc": "poc", "poc_strength": "pocs",
-    "poc_zone_high": "pocH", "poc_zone_low": "pocL",
-    "inside_poc": "inPoc", "poc_distance_pct": "pocD",
-    "vah": "vah", "val": "val",
-    "premium_discount": "pd", "range_high": "rh", "range_low": "rl",
-    "equilibrium": "eq", "price_vs_eq_pct": "peq",
-    "ote_long": "oteL", "ote_short": "oteS",
-    "swing_high": "sh", "swing_low": "sl",
-    "swing_high2": "sh2", "swing_low2": "sl2",
-    "bos": "bos", "choch": "choch", "bos_level": "bosl",
-    "ob_type": "ob", "ob_top": "obT", "ob_bottom": "obB",
-    "ob_strength": "obs", "ob_list": "obL", "ob_mit": "obM",
-    "bb_type": "bb", "bb_top": "bbT", "bb_bottom": "bbB",
-    "fvg_type": "fvg", "fvg_top": "fvgT", "fvg_bottom": "fvgB",
-    "fvg_list": "fvgL", "fvg_mit": "fvgM",
-    "liquidity_levels": "liq",
-    "liq_buy_side": "liqBS", "liq_sell_side": "liqSS",
-    "eq_highs": "eqh", "eq_lows": "eql",
-    "recent_sweep": "swp",
-    "sr_levels": "sr", "rsi_div": "rsiDiv", "rv": "rv",
-    "last_close": "lc", "last_candle_dir": "lcd",
-    "last_struct": "ls", "recent_highs": "rhi", "recent_lows": "rlo",
-}
+import pandas as pd
 
 
-def _compress(d: Dict[str, Any]) -> Dict[str, Any]:
-    out = {}
-    for k, v in d.items():
-        short = _KEY_MAP.get(k, k)
-        if v is None or v == [] or v == {}:
-            continue
-        out[short] = v
-    return out
+def _r(x: float) -> float:
+    return float(f"{x:.6g}")
 
 
-def build_payload(all_symbol_data: List[Dict[str, Any]]) -> str:
-    compact = []
-    for sym_data in all_symbol_data:
-        entry = {}
-        for tf in TIMEFRAMES:
-            tf_data = sym_data.get(tf)
-            if tf_data:
-                entry[tf] = _compress(tf_data)
-        if entry:
-            entry["s"] = sym_data["symbol"]
-            compact.append(entry)
+def _ohlc(df: pd.DataFrame, n: int) -> List[List[float]]:
+    return [[_r(a) for a in row] for row in df[["open", "high", "low", "close"]].tail(n).values.tolist()]
 
-    payload = {
-        "market_context": {
-            "total_symbols": len(compact),
-            "timeframes": TIMEFRAMES,
-        },
-        "data": compact,
+
+def candidate_entry(c: Dict[str, Any], frames: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    e = c["evidence"]
+    return {
+        "s": c["symbol"], "dir": c["direction"], "type": c["setup_type"], "et": c["entry_type"],
+        "e": _r(c["entry"]), "z": [_r(c["zone_low"]), _r(c["zone_high"])], "sl": _r(c["sl"]),
+        "tp": [_r(c["tp1"]), _r(c["tp2"]), _r(c["tp3"])],
+        "tps": [t["src"] for t in e["targets"]],
+        "nrr": c["net_rr"], "risk%": c["risk_pct"], "atr": _r(c["atr15"]), "px": _r(c["price"]),
+        "ctx": {"b1": e["bias_1h"], "b15": e["bias_15m"],
+                "r1": [_r(e["range_1h"]["lo"]), _r(e["range_1h"]["eq"]), _r(e["range_1h"]["hi"])]},
+        "sw": {"level": _r(e["sweep"]["level"]), "src": e["sweep"]["src"], "ts": e["sweep"]["sweep_ts"],
+               "wick": _r(e["sweep"]["wick"])},
+        "mss": {"ref": _r(e["mss"]["ref_price"]), "ts": e["mss"]["break_ts"], "disp": round(e["mss"]["disp_atr"], 2),
+                "rv": round(e["mss"]["rv"], 2), "age": e["mss"]["age_bars"]},
+        "zone": {"kind": e["zone"]["kind"], "touches": e["zone"]["touches"]},
+        "r5": c.get("refine_5m", "none"),
+        "c15": _ohlc(frames["15m"], 12), "c5": _ohlc(frames["5m"], 18),
     }
-    s = json.dumps(payload, separators=(",", ":"))
-    logger.info("Payload: %d symbols, %d chars, TFs=%s",
-                len(compact), len(s), TIMEFRAMES)
-    return s
+
+
+def build_candidate_payload(cands: List[Dict[str, Any]], frames_by_sym: Dict[str, Dict[str, pd.DataFrame]]) -> str:
+    return json.dumps([candidate_entry(c, frames_by_sym[c["symbol"]]) for c in cands],
+                      separators=(",", ":"), ensure_ascii=False)
