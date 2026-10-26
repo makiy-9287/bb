@@ -97,6 +97,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pnl    — net performance (fees/slippage/funding)\n"
         "/stats  — same as /pnl\n"
         "/scan   — scan now (still obeys ON/OFF)\n"
+        "/payload — best-30 scalp file for manual AI analysis\n"
         "/help   — this message"
     )
 
@@ -140,6 +141,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧠 `{OPENROUTER_MODEL}` · keys: `{len(OPENROUTER_API_KEYS)}`\n"
         f"🪙 `{TOP_COINS_LIMIT}` coins | `1H bias · 15m setup · 5m entry`"
     )
+
+
+async def cmd_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual workflow: build the best-30 scalp file and send it (plus the prompt) as Telegram documents."""
+    if not _is_admin(update):
+        return
+    await _reply(update, "⏳ Building scalp payload (30 coins, 1h/15m/5m/3m)… ~1 min")
+    try:
+        from manual_payload import build_and_save, describe, send_telegram_document, PROMPT_FILE
+        import json as _json
+        paths, _ = await build_and_save()
+        chat = update.effective_chat.id
+        for p in paths:
+            await send_telegram_document(p, "📦 Scalp payload — " + describe(p, _json.load(open(p, encoding="utf-8"))), chat)
+        await send_telegram_document(PROMPT_FILE, "📝 Prompt — upload both to your AI", chat)
+    except Exception as exc:
+        logger.exception("payload failed")
+        await _reply(update, f"❌ Payload failed: {str(exc)[:300]}")
 
 
 async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,6 +264,7 @@ async def telegram_bot_loop():
     app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("pnl",    cmd_pnl))
     app.add_handler(CommandHandler("scan",   cmd_scan))
+    app.add_handler(CommandHandler("payload", cmd_payload))
     app.add_handler(CommandHandler("on",     cmd_on))
     app.add_handler(CommandHandler("off",    cmd_off))
     app.add_handler(CommandHandler("stats",  cmd_pnl))
