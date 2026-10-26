@@ -126,7 +126,7 @@ SIGNAL_MAX_AGE_SEC   = 600      # model answer older than this (or price run awa
 KEY_FAILOVER_TRIES   = 3        # if the assigned key fails, try the next keys (bounded)
 
 # ── Manual AI payload (manual_payload.py) ────────────────────────
-MANUAL_TOP_N   = 30
-MANUAL_COUNTS  = {"1h": 48, "15m": 64, "5m": 60, "3m": 40}     # candles per TF written to the file
+MANUAL_TOP_N   = 50
+MANUAL_COUNTS  = {"1h": 200, "15m": 150, "5m": 60, "3m": 40}     # candles per TF written to the file
 MANUAL_MIN_ATR15_PCT = 0.10                                    # skip dead coins (15m ATR % of price)
-MANUAL_MAX_TOKENS_PER_FILE = 90_000                           # rough estimate; above this the file is split in parts
+MANUAL_MAX_TOKENS_PER_FILE = 300_000                        # rough estimate; above this the file is split in parts
