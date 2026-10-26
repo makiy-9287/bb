@@ -1,23 +1,16 @@
-# Scalp Hybrid Agent (Binance USDT-M perps)
+# V10 — Support/Resistance agent (4h · 1h · 15m)
 
-**Flow (every 5m candle close, Python only):** 60 liquid perps → closed-candle data (1h×250, 15m×200, 5m×100)
-→ 1h bias · 15m liquidity sweep + displacement MSS + OB/FVG zone · 5m entry confirmation → engine-confirmed setups.
-If a scan has setups they are sent as ONE payload to the NEXT OpenRouter key (1→15→1 round-robin, background call,
-failover to following keys). The model picks ≤1; server re-validates every number; fresh-price gate; Telegram; tracking.
+Every 15 min, 12:00–19:00 Asia/Colombo (/on /off): top-60 liquid USDT perps → closed candles (4h×200, 1h×200, 15m×150)
+→ 4 coins per API call (group i → key i, launches 1/sec) → **the prompt** finds high-probability S/R zones with 15m
+confirmation, entry, SL and next-level targets; each call returns ≤1 best setup → a judge call picks the single best →
+Telegram **admin chat only** → simulated tracking (/trades /pnl).
 
-## Setup
+Script-side filtering: none for strategy. It only checks the model's output is well-formed (known symbol, finite numbers,
+SL/TP on the right side) and skips coins that already have a live trade or were signalled in the last DEDUPE_HOURS.
+
+## Run
     pip install -r requirements.txt
-    cp .env.example .env      # fill TELEGRAM_* and OPENROUTER_API_KEY_1..15  (never commit .env)
-    python main.py            # control from Telegram: /on /off /status /trades /pnl /scan
-No LLM keys? `ENGINE_ONLY_MODE=1`. Tests: `pip install pytest && python -m pytest tests -q`.
-Backtest (engine only, no LLM): `python backtest.py --csv BTCUSDT_5m.csv --rr 1.5 2.0` (or `--synthetic` smoke test).
-
-## Files
-main.py (scan loop, round-robin, gates) · ict_engine.py (causal ICT engine, definitions in its docstring) ·
-data_fetcher.py/ohlcv.py (universe + closed-candle hygiene) · risk.py (net RR, limits) · agent.py (prompt, schema,
-validation, queue) · trade_monitor.py/performance.py (state machine, net R stats) · backtest.py · schedule.py (optional window)
-· legacy/indicators.py (old indicator path, unused).
-
-## Honest limits
-Simulated fills on 1m candles (touch = fill); no exchange execution; heuristic score ≠ win probability;
-backtests/synthetic tests prove code behaviour, not profitability. Keep size small until real forward results exist.
+    cp .env.example .env     # fill TELEGRAM_* and OPENROUTER_API_KEY_1..15
+    python3 cleanup_v10.py   # once, if old files are in the folder (deletes obsolete files, then itself)
+    python3 main.py
+Tests: `pip install pytest && python3 -m pytest tests -q`

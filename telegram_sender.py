@@ -1,13 +1,12 @@
 """
-Broadcast sender — admin + friend IDs receive signals.
-Only the admin ID can issue commands (enforced in telegram_bot.py).
+Telegram sender — ADMIN CHAT ONLY (signals and trade updates). Nobody else ever receives anything.
 """
 import asyncio
 import logging
 import aiohttp
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, TELEGRAM_BROADCAST_IDS, SIGNAL_EXPIRY_MIN,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, SIGNAL_EXPIRY_MIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,13 +28,8 @@ def _escape_md(text: str) -> str:
 
 
 def _broadcast_ids() -> list[str]:
-    ids = [TELEGRAM_ADMIN_ID] + TELEGRAM_BROADCAST_IDS
-    seen, out = set(), []
-    for x in ids:
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    """Admin only. (Kept under this name for backward compatibility.)"""
+    return [TELEGRAM_ADMIN_ID] if TELEGRAM_ADMIN_ID else []
 
 
 async def _send_to(chat_id: str, text: str) -> bool:
@@ -86,15 +80,12 @@ async def send_signal(signal: dict) -> bool:
     direction = signal.get("direction", "???").upper()
     entry_type = signal.get("entry_type", "CMP")
     emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
-    reason = _escape_md(str(signal.get("reason", "")))
-
     zone_line = ""
-    if entry_type == "LIMIT" and signal.get("zone_high") and signal.get("zone_low"):
-        zone_line = (f"📦 Zone: `{signal['zone_low']}` – "
-                     f"`{signal['zone_high']}`\n")
-
+    if signal.get("zone_high") and signal.get("zone_low"):
+        zone_line = f"📦 Zone: `{signal['zone_low']}` – `{signal['zone_high']}`\n"
+    exp = f"⏳ Limit expires in `{SIGNAL_EXPIRY_MIN}m` if unfilled\n" if entry_type == "LIMIT" else ""
     text = (
-        f"{emoji} *{direction}* | `{sym}`\n"
+        f"{emoji} *{direction}* | `{sym}`  _(S/R zone)_\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚡ Type: `{entry_type}`\n"
         f"💰 Entry: `{signal.get('entry', '-')}`\n"
@@ -104,12 +95,12 @@ async def send_signal(signal: dict) -> bool:
         f"🎯 TP2:  `{signal.get('tp2', '-')}`\n"
         f"🎯 TP3:  `{signal.get('tp3', '-')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧭 Setup: `{signal.get('setup_type', '-')}` · grade `{signal.get('confidence', '-')}`\n"
-        f"📈 Net R:R (TP1, after costs): `{signal.get('net_rr', signal.get('rr_ratio', '-'))}` "
-        f"· gross `{signal.get('gross_rr', '-')}`\n"
-        f"⭐ Heuristic score: `{signal.get('score', '-')}/100` _(ranking only, not a win probability)_\n"
-        f"⏳ Limit expires in `{SIGNAL_EXPIRY_MIN}m` if unfilled\n"
-        f"📝 {reason}"
+        f"📈 Net R:R (TP1, after costs): `{signal.get('net_rr', '-')}`\n"
+        f"⭐ Quality (model's own 0-100, not a win probability): `{signal.get('quality', '-')}`\n"
+        f"{exp}"
+        f"🧭 {_escape_md(str(signal.get('confluence', '')))}\n"
+        f"✅ {_escape_md(str(signal.get('confirmation', '')))}\n"
+        f"📝 {_escape_md(str(signal.get('reason', '')))}"
     )
     return await _broadcast(text)
 

@@ -1,38 +1,50 @@
-"""Compact payload for the LLM reviewer: only fully-confirmed setups, with the evidence needed to judge them."""
+"""
+Agent payload — exactly the format requested:
+
+  {"coin":"SOLUSDT",
+   "data_4h":[{"T":"10-26,00:00","O":165.45,"H":168.2,"L":164.1,"C":167.35,"V":245120.45}, ...200],
+   "data_1h":[... 200], "data_15m":[... 150]}
+
+T = candle OPEN time, UTC, "MM-DD,HH:MM". Candles are CLOSED only, oldest → newest.
+A group message = short header (generation time, last closed candle per TF, live prices) + a JSON list of coins.
+"""
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import pandas as pd
 
+from config import TIMEFRAMES
 
-def _r(x: float) -> float:
-    return float(f"{x:.6g}")
-
-
-def _ohlc(df: pd.DataFrame, n: int) -> List[List[float]]:
-    return [[_r(a) for a in row] for row in df[["open", "high", "low", "close"]].tail(n).values.tolist()]
+KEYS = ("T", "O", "H", "L", "C", "V")
 
 
-def candidate_entry(c: Dict[str, Any], frames: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    e = c["evidence"]
-    return {
-        "s": c["symbol"], "dir": c["direction"], "type": c["setup_type"], "et": c["entry_type"],
-        "e": _r(c["entry"]), "z": [_r(c["zone_low"]), _r(c["zone_high"])], "sl": _r(c["sl"]),
-        "tp": [_r(c["tp1"]), _r(c["tp2"]), _r(c["tp3"])],
-        "tps": [t["src"] for t in e["targets"]],
-        "nrr": c["net_rr"], "risk%": c["risk_pct"], "atr": _r(c["atr15"]), "px": _r(c["price"]),
-        "ctx": {"b1": e["bias_1h"], "b15": e["bias_15m"],
-                "r1": [_r(e["range_1h"]["lo"]), _r(e["range_1h"]["eq"]), _r(e["range_1h"]["hi"])]},
-        "sw": {"level": _r(e["sweep"]["level"]), "src": e["sweep"]["src"], "ts": e["sweep"]["sweep_ts"],
-               "wick": _r(e["sweep"]["wick"])},
-        "mss": {"ref": _r(e["mss"]["ref_price"]), "ts": e["mss"]["break_ts"], "disp": round(e["mss"]["disp_atr"], 2),
-                "rv": round(e["mss"]["rv"], 2), "age": e["mss"]["age_bars"]},
-        "zone": {"kind": e["zone"]["kind"], "touches": e["zone"]["touches"]},
-        "r5": c.get("refine_5m", "none"),
-        "c15": _ohlc(frames["15m"], 12), "c5": _ohlc(frames["5m"], 18),
-    }
+def fmt_t(ms: int) -> str:
+    return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%m-%d,%H:%M")
 
 
-def build_candidate_payload(cands: List[Dict[str, Any]], frames_by_sym: Dict[str, Dict[str, pd.DataFrame]]) -> str:
-    return json.dumps([candidate_entry(c, frames_by_sym[c["symbol"]]) for c in cands],
-                      separators=(",", ":"), ensure_ascii=False)
+def _p(x: float) -> float:
+    return float(f"{x:.8g}")
+
+
+def candles(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    return [{"T": fmt_t(t), "O": _p(o), "H": _p(h), "L": _p(l), "C": _p(c), "V": round(float(v), 2)}
+            for t, o, h, l, c, v in df[["t", "open", "high", "low", "close", "volume"]].itertuples(index=False)]
+
+
+def coin_payload(symbol: str, frames: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"coin": symbol}
+    for tf in TIMEFRAMES:
+        out[f"data_{tf}"] = candles(frames[tf])
+    return out
+
+
+def build_group_text(symbols: List[str], frames: Dict[str, Dict[str, pd.DataFrame]], prices: Dict[str, float],
+                     now_ms: int) -> str:
+    first = frames[symbols[0]]
+    last = ", ".join(f"{tf} {fmt_t(int(first[tf]['t'].iloc[-1]))}" for tf in TIMEFRAMES)
+    live = ", ".join(f"{s}={_p(prices[s])}" for s in symbols)
+    header = (f"Data generated (UTC): {fmt_t(now_ms)}. Candle open times are UTC. Last CLOSED candle per timeframe → {last}.\n"
+              f"Live prices now: {live}\nCOINS:\n")
+    body = json.dumps([coin_payload(s, frames[s]) for s in symbols], separators=(",", ":"), ensure_ascii=False)
+    return header + body
