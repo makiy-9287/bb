@@ -13,7 +13,8 @@ load_dotenv()
 OPENROUTER_API_KEYS = [k for k in (os.getenv(f"OPENROUTER_API_KEY_{i}", "").strip() for i in range(1, 16)) if k]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
-REASONING_EFFORT    = os.getenv("REASONING_EFFORT", "high")
+REASONING_EFFORT    = os.getenv("REASONING_EFFORT", "medium")
+MAX_OUTPUT_TOKENS   = int(os.getenv("MAX_OUTPUT_TOKENS", "24000"))   # reasoning + answer; too small → "output cut (length)"
 
 # ── Telegram: ADMIN ONLY (signals, trade updates, commands) ───────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,7 +46,7 @@ ALERT_COOLDOWN_MIN = 30                              # admin alerts about failur
 SCAN_INTERVAL_MIN = 15
 SCAN_OFFSET_SEC   = 10                               # wait after the candle close so exchange data settles
 TIMEZONE      = "Asia/Colombo"                       # UTC+05:30, no DST
-WINDOW_START  = dt_time(12, 0)                       # inclusive
+WINDOW_START  = dt_time(9, 0)                       # inclusive
 WINDOW_END    = dt_time(19, 0)                       # exclusive → last scan 18:45
 _DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 TRADING_WEEKDAYS = {i for i, d in enumerate(_DAYS)
