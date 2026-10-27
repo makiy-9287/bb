@@ -12,7 +12,7 @@ load_dotenv()
 # ── OpenRouter (up to 15 keys; group i → key i) ──────────────────
 OPENROUTER_API_KEYS = [k for k in (os.getenv(f"OPENROUTER_API_KEY_{i}", "").strip() for i in range(1, 16)) if k]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
 REASONING_EFFORT    = os.getenv("REASONING_EFFORT", "high")
 
 # ── Telegram: ADMIN ONLY (signals, trade updates, commands) ───────
@@ -28,9 +28,18 @@ MAX_SPREAD_PCT        = 0.05
 MAX_DATA_STALE_BARS   = 3
 
 # ── Timeframes: 4h 200 · 1h 200 · 15m 150 (closed candles only) ───
-TIMEFRAMES    = ["4h", "1h", "15m"]
-CANDLE_LIMITS = {"4h": 200, "1h": 200, "15m": 150}
-COINS_PER_CALL = 4                                   # 60 coins → 15 calls → 15 keys
+TIMEFRAMES    = ["4h", "1h", "15m", "5m"]
+SHOW_CANDLES  = 100                                  # candles drawn in each chart AND written to the text payload
+WARMUP_CANDLES = 150                                 # extra history so MA/RSI are accurate on the first drawn candle
+CANDLE_LIMITS = {tf: SHOW_CANDLES + WARMUP_CANDLES for tf in TIMEFRAMES}
+COINS_PER_CALL = 4                                   # 60 coins → 15 calls → 15 keys (4 coins × 4 charts = 16 images / call)
+
+# ── Charts (vision input): 1536×1024 = 3×2 tiles of 512 px (native tile size of the Nemotron VL encoder) ──
+CHART_W, CHART_H = 1536, 1024
+MA_PERIODS = (20, 50)
+RSI_LEN    = 14
+CHART_WORKERS = int(os.getenv("CHART_WORKERS", str(min(8, os.cpu_count() or 1))))
+ALERT_COOLDOWN_MIN = 30                              # admin alerts about failures are rate-limited
 
 # ── Scan schedule: every 15 minutes, 12:00–19:00 Asia/Colombo ─────
 SCAN_INTERVAL_MIN = 15

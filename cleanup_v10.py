@@ -26,8 +26,9 @@ OBSOLETE_GLOBS_IN = {"outputs": ("scalp_payload_", ".json")}        # old manual
 
 def _looks_like_v10() -> bool:
     try:
-        return open(os.path.join(HERE, "VERSION"), encoding="utf-8").read().strip() == "V10" and \
-            "V10" in open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
+        v = open(os.path.join(HERE, "VERSION"), encoding="utf-8").read().strip()
+        return v in ("V10", "V11") and ("V10" in open(os.path.join(HERE, "main.py"), encoding="utf-8").read() or
+                                        "V11" in open(os.path.join(HERE, "main.py"), encoding="utf-8").read())
     except OSError:
         return False
 
