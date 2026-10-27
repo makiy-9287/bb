@@ -27,6 +27,8 @@ from trade_monitor import monitor_loop, add_trade, get_pending_trades, get_activ
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     handlers=[logging.StreamHandler(), logging.FileHandler("agent.log", encoding="utf-8")])
+for _noisy in ("httpx", "httpcore", "hpack", "h2", "telegram", "openai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)      # httpx logs full URLs — that would print the Telegram bot token
 logger = logging.getLogger("main")
 
 _SENT: Dict[str, float] = {}                    # symbol → time it was last signalled (repeat protection)
