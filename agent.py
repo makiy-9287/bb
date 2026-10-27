@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
-from config import OPENROUTER_API_KEYS, OPENROUTER_BASE_URL, OPENROUTER_MODEL, REASONING_EFFORT
+from config import OPENROUTER_API_KEYS, OPENROUTER_BASE_URL, OPENROUTER_MODEL, REASONING_EFFORT, MAX_OUTPUT_TOKENS
 from risk import check_levels, net_rr
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _CLIENTS: List[AsyncOpenAI] = []
 _SLEEP = asyncio.sleep                 # indirection so tests run without real delays
 _API_TIMEOUT = 420                     # 4 coins × (400 candles + 16 images) + reasoning on a free model
-_MAX_ATTEMPTS = 2
+_MAX_ATTEMPTS = 3
 _GROUP_DEADLINE = 700
 _LAUNCH_GAP_SEC = 1.0                  # one request START per second (group1 @0s, group2 @1s …)
 _JUDGE_TIMEOUT = 240
@@ -211,11 +211,12 @@ async def _chat(client, key_idx: int, tag: str, messages: List[Dict[str, Any]], 
     """One model call with bounded retries (429/5xx/timeout/empty body/length). Returns (message | None, last_error)."""
     started, effort, err = time.monotonic(), REASONING_EFFORT, ""
     use_reasoning = bool(REASONING_EFFORT)
+    max_tokens = MAX_OUTPUT_TOKENS
     for attempt in range(1, attempts + 1):
         await gate.wait()
         wait = 0.0
         try:
-            kwargs: Dict[str, Any] = dict(model=OPENROUTER_MODEL, messages=messages, tools=tools, tool_choice="auto", max_tokens=8000)
+            kwargs: Dict[str, Any] = dict(model=OPENROUTER_MODEL, messages=messages, tools=tools, tool_choice="auto", max_tokens=max_tokens)
             if use_reasoning:
                 kwargs["extra_body"] = {"reasoning": {"effort": effort, "enabled": True}}
             resp = await asyncio.wait_for(client.chat.completions.create(**kwargs), timeout=timeout)
@@ -250,8 +251,9 @@ async def _chat(client, key_idx: int, tag: str, messages: List[Dict[str, Any]], 
                 ch = choices[0]
                 m = ch.message
                 if not m.tool_calls and not (m.content or "").strip() and getattr(ch, "finish_reason", None) == "length":
-                    effort = "medium" if effort == "high" else "low"
-                    err, wait = "output cut by reasoning (length) → lower effort", 2
+                    effort = "low"                                       # the model spent the whole budget thinking
+                    max_tokens = min(int(max_tokens * 1.5), 48000)       # …so also give it more room next time
+                    err, wait = f"output cut by reasoning (length) → effort low, max_tokens {max_tokens}", 2
                 else:
                     return m, ""
         logger.warning("%s (key %d) attempt %d/%d: %s", tag, key_idx, attempt, attempts, err)
